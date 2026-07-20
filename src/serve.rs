@@ -2,6 +2,7 @@ use crate::campaign::{cmd_ruling, cmd_thread, ensure_vault, md_files, CAMPAIGN};
 use crate::ledger::{current_day, fm_value};
 use crate::{read_lossy, Result};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -62,9 +63,10 @@ pub(crate) fn cmd_serve(args: &[String]) -> Result<()> {
                 std::thread::spawn(move || stream_events(request, st));
             }
             (Method::Post, "/action") => {
-                let resp = handle_action(request, &state);
-                // request already consumed inside handle_action
-                let _ = resp;
+                // off the accept loop: a slow/held-open body must not freeze the
+                // whole dashboard for every other client
+                let st = Arc::clone(&state);
+                std::thread::spawn(move || handle_action(request, st));
             }
             _ => {
                 let _ = request.respond(Response::from_string("not found").with_status_code(404));
@@ -82,7 +84,8 @@ pub(crate) fn cmd_serve(args: &[String]) -> Result<()> {
 struct State {
     log: Vec<Ev>,
     next_id: u64,
-    processed: usize, // cards-jsonl lines already turned into Card events
+    processed: usize,     // cards-jsonl lines already turned into Card events
+    acted: HashSet<u64>,  // card ids already actioned — makes taps idempotent
     threads_json: String,
     transcript: String,
 }
@@ -108,7 +111,15 @@ fn spawn_poller(state: Arc<Mutex<State>>) {
                         st.log.push(Ev::Card { id, card });
                         st.processed += 1;
                     }
-                    Err(_) => break, // partial trailing write; retry next tick
+                    Err(_) if st.processed == lines.len() - 1 => {
+                        break; // last line: likely a partial trailing write, retry next tick
+                    }
+                    Err(_) => {
+                        // a complete line that will never parse — skip it rather
+                        // than wedging every card written after it for the session
+                        eprintln!("serve: skipping unparseable card line {}", st.processed + 1);
+                        st.processed += 1;
+                    }
                 }
             }
         }
@@ -193,70 +204,78 @@ fn sse(event: &str, data: &str) -> String {
 // ---------- actions ----------
 
 /// One tap → one existing vault command. Nothing writes without a tap; the
-/// card leaves every feed via a Dismiss broadcast once acted.
-fn handle_action(mut request: tiny_http::Request, state: &Arc<Mutex<State>>) {
+/// card is claimed under the lock BEFORE any write, so a double-tap or two
+/// devices tapping the same card can't double-write the vault.
+fn handle_action(mut request: tiny_http::Request, state: Arc<Mutex<State>>) {
     let mut body = String::new();
     let cap = request.body_length().unwrap_or(0).min(MAX_BODY);
     let _ = request.as_reader().take(cap as u64).read_to_string(&mut body);
     let req: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-    let action = req["action"].as_str().unwrap_or("");
-    let id = req["id"].as_u64();
+    let action = req["action"].as_str().unwrap_or("").to_string();
 
-    // pull the card out under the lock, then run the (slow, re-indexing) command
-    // without holding it
-    let card = id.and_then(|id| {
-        let st = state.lock().unwrap();
-        st.log.iter().find_map(|ev| match ev {
+    // claim the card: find it and mark it acted atomically, so a concurrent or
+    // repeated tap on the same id is rejected before any file write happens
+    let claimed = req["id"].as_u64().and_then(|id| {
+        let mut st = state.lock().unwrap();
+        let card = st.log.iter().find_map(|ev| match ev {
             Ev::Card { id: cid, card } if *cid == id => Some(card.clone()),
             _ => None,
-        })
+        })?;
+        if st.acted.insert(id) {
+            Some((id, card))
+        } else {
+            None // already handled (or being handled)
+        }
     });
+    let Some((id, card)) = claimed else {
+        let msg = if req["id"].as_u64().is_none() { "no such card" } else { "already handled" };
+        respond_json(request, json!({ "ok": false, "msg": msg }));
+        return;
+    };
 
-    let result: Result<String> = (|| {
-        let card = card.ok_or("no such card")?;
-        let headline = card["headline"].as_str().unwrap_or("").trim();
-        match action {
-            "dismiss" => Ok("dismissed".into()),
-            "ruling" => {
-                let body = card["body"].as_str().unwrap_or("");
-                let text = if body.is_empty() {
-                    headline.to_string()
-                } else {
-                    format!("{headline} — {body}")
-                };
-                if text.trim().is_empty() {
-                    return Err("card has no text to record".into());
-                }
-                cmd_ruling(&text)?;
-                Ok("saved as a table ruling".into())
+    let headline = card["headline"].as_str().unwrap_or("").trim();
+    let result: Result<String> = match action.as_str() {
+        "dismiss" => Ok("dismissed".into()),
+        "ruling" => {
+            let body = card["body"].as_str().unwrap_or("");
+            let text = if body.is_empty() { headline.to_string() } else { format!("{headline} — {body}") };
+            if text.trim().is_empty() {
+                Err("card has no text to record".into())
+            } else {
+                cmd_ruling(&text).map(|_| "saved as a table ruling".into())
             }
-            "thread" => {
-                if headline.is_empty() {
-                    return Err("card has no title for a thread".into());
-                }
+        }
+        "thread" => {
+            if headline.is_empty() {
+                Err("card has no title for a thread".into())
+            } else {
                 match cmd_thread(&["add".to_string(), headline.to_string()]) {
                     Ok(()) => Ok("opened a thread".into()),
-                    // a duplicate title isn't a failure worth blocking the tap on
                     Err(e) if e.to_string().contains("already exists") => Ok("thread already open".into()),
                     Err(e) => Err(e),
                 }
             }
-            other => Err(format!("unknown action `{other}`").into()),
         }
-    })();
-
-    // acted-on cards leave the feed regardless of which action fired
-    if let (Some(id), Ok(_)) = (id, &result) {
-        let mut st = state.lock().unwrap();
-        st.log.push(Ev::Dismiss(id));
-    }
-    let payload = match result {
-        Ok(msg) => json!({ "ok": true, "msg": msg }),
-        Err(e) => json!({ "ok": false, "msg": e.to_string() }),
+        other => Err(format!("unknown action `{other}`").into()),
     };
-    let _ = request.respond(
-        Response::from_string(payload.to_string()).with_header(json_hdr()),
-    );
+
+    let mut st = state.lock().unwrap();
+    let payload = match result {
+        Ok(msg) => {
+            st.log.push(Ev::Dismiss(id)); // acted-on card leaves every feed
+            json!({ "ok": true, "msg": msg })
+        }
+        Err(e) => {
+            st.acted.remove(&id); // write failed — let the DM retry this card
+            json!({ "ok": false, "msg": e.to_string() })
+        }
+    };
+    drop(st);
+    respond_json(request, payload);
+}
+
+fn respond_json(request: tiny_http::Request, payload: Value) {
+    let _ = request.respond(Response::from_string(payload.to_string()).with_header(json_hdr()));
 }
 
 // ---------- vault reads ----------
