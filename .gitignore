@@ -6,3 +6,4 @@ magehand.db
 *.bin
 .obsidian
 .DS_Store
+token.txt
