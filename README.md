@@ -115,9 +115,36 @@ one-tap actions wired to existing commands: **Save ruling** (rules cards →
 `ruling`), **Open thread** (fact/trigger cards → `thread add`), **Dismiss**.
 Nothing writes to the vault without a tap. `--port N` overrides the default 7979.
 
-Design and later phase (player QR pages, sheets): `TABLE-MODE.md`.
-Start with the MacBook's built-in mics; a $30-60 conference puck (eMeet/TONOR
-class) is the cheap upgrade if a real session's transcript looks rough.
+### Phase 4 — player pages + character sheets
+
+`magehand serve` also hosts a zero-install player surface. Its startup prints a
+**join page** URL (`/join?t=…`, DM-only); open it on the laptop and it shows one
+**QR code per player**. A player scans theirs once — that capability URL *is*
+their login (a cookie pins it), no app, no account. Their phone page has three
+tabs: **Sheet** (live HP / slots / conditions with big ± buttons), **Ask**
+(spoiler-safe rules/lore Q&A over the `--player` retrieval, rate-limited, every
+answer footed "ask your DM to be sure"), and **Stuff** (their own secrets and
+the latest recap). Each player sees **only their own** secrets — the token maps
+to one player and scopes retrieval server-side.
+
+Character sheets are vault markdown (`sources/campaign/sheets/<slug>.md`): the
+~two dozen numbers that change at the table live in the frontmatter (the phone's
+± buttons edit those); everything else is freeform prose below the fence, edited
+in Obsidian. Not a character builder — build and level in D&D Beyond or on paper.
+
+```sh
+magehand sheet new "Mira Quickfingers"   # scaffold a blank sheet
+magehand sheet import "Mira" -            # fill it from pasted D&D Beyond text (stdin)
+```
+
+**Slug consistency:** a player is identified by their file slug, so their sheet,
+backstory (`backstories/<slug>.md`), and secrets (`secrets/<slug>.md`) must
+share one — name the sheet to match (e.g. all three `mira.md`) or the roster
+treats them as different people.
+
+Full design: `TABLE-MODE.md`. Start with the MacBook's built-in mics; a $30-60
+conference puck (eMeet/TONOR class) is the cheap upgrade if a real session's
+transcript looks rough.
 
 Write-back commands re-index automatically; answers get labeled excerpts with
 precedence **house rules > campaign canon > rulebooks**, and conflicts are flagged.

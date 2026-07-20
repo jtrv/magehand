@@ -4,6 +4,7 @@ mod ledger;
 mod listen;
 mod players;
 mod serve;
+mod sheets;
 mod signals;
 
 use rusqlite::Connection;
@@ -84,6 +85,7 @@ fn main() {
         Some("listen") => listen::cmd_listen(&args[1..]),
         Some("cards") => signals::cmd_cards(&args[1..]),
         Some("serve") => serve::cmd_serve(&args[1..]),
+        Some("sheet") => sheets::cmd_sheet(&args[1..]),
         _ => {
             eprintln!("usage: magehand <command> [--player]");
             eprintln!("  ingest                       index everything under sources/");
@@ -113,7 +115,8 @@ fn main() {
             eprintln!("  statblock <name|--stub desc> [--save] play crib or homebrew draft");
             eprintln!("  listen [--stdin] [--shadow]  live table transcript + signal cards; Ctrl-C archives");
             eprintln!("  cards [date]                 review a session's card log (grade shadow runs)");
-            eprintln!("  serve [--port N]             DM dashboard: live card feed + one-tap actions (LAN)");
+            eprintln!("  serve [--port N]             DM dashboard + player pages (LAN); prints QR join page");
+            eprintln!("  sheet new <player>           scaffold a character sheet; `sheet import <player>` from pasted text");
             eprintln!("  --player                     spoiler-safe retrieval (search/ask/chat)");
             std::process::exit(2);
         }
@@ -586,7 +589,7 @@ fn expand_query(llm: &Llm, question: &str) -> String {
     }
 }
 
-fn answer(
+pub(crate) fn answer(
     conn: &Connection,
     llm: &Llm,
     history: &mut Vec<Value>,

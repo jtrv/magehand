@@ -1,8 +1,9 @@
 use crate::campaign::{cmd_ruling, cmd_thread, ensure_vault, md_files, CAMPAIGN};
 use crate::ledger::{current_day, fm_value};
-use crate::{read_lossy, Result};
+use crate::sheets;
+use crate::{answer, llm_config, open_db, read_lossy, Result};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -11,8 +12,24 @@ use tiny_http::{Header, Method, Response, Server};
 
 const CARDS_DIR: &str = ".magehand/live";
 const DM_HTML: &str = include_str!("dm.html");
+const PLAYER_HTML: &str = include_str!("player.html");
 const POLL: Duration = Duration::from_millis(700);
 const MAX_BODY: usize = 16 * 1024;
+const ASK_PER_HOUR: usize = 12;
+
+/// Player roster + capability tokens (immutable after startup) and per-player
+/// ask rate limiting.
+struct Players {
+    by_token: HashMap<String, PInfo>,
+    ask_log: Mutex<HashMap<String, Vec<Instant>>>,
+}
+
+#[derive(Clone)]
+struct PInfo {
+    slug: String,
+    name: String,
+    token: String,
+}
 
 /// Phase 3 of table mode: the DM dashboard. A LAN web page (token-gated, since
 /// it shows secrets) that tails the listener's card JSONL over SSE and turns
@@ -27,38 +44,51 @@ pub(crate) fn cmd_serve(args: &[String]) -> Result<()> {
 
     let state = Arc::new(Mutex::new(State::default()));
     spawn_poller(Arc::clone(&state));
+    let players = Arc::new(build_players()?);
 
     let base = lan_url(port);
-    println!("magehand dashboard (DM-only — shows secrets)\n");
-    println!("  open on the DM laptop:  http://localhost:{port}/?t={token}");
-    println!("  open on a tablet/LAN:   {base}/?t={token}");
-    println!("\nrun `magehand listen` alongside this to feed the card feed. Ctrl-C to stop.");
+    println!("magehand table server\n");
+    println!("  DM dashboard (shows secrets):  {base}/?t={token}");
+    println!("  player join page (QR codes):   {base}/join?t={token}");
+    println!(
+        "\n{} player(s) rostered. Open the join page on the DM laptop and let players scan.",
+        players.by_token.len()
+    );
+    println!("run `magehand listen` alongside this to feed the card feed. Ctrl-C to stop.");
 
     for request in server.incoming_requests() {
         let method = request.method().clone();
         let url = request.url().to_string();
-        let path = url.split('?').next().unwrap_or("/");
+        let path = url.split('?').next().unwrap_or("/").to_string();
 
+        // --- player routes (own capability cookie, scoped to one player) ---
+        if let Some(seg) = path.strip_prefix("/p/") {
+            route_player(request, &method, seg, &url, &players, &state);
+            continue;
+        }
+
+        // --- DM routes (require the DM token) ---
         if !authed(&request, &token) {
-            // the landing route may carry the token in the query and set a cookie
             if method == Method::Get && path == "/" && query_token(&url).as_deref() == Some(&token) {
                 let _ = request.respond(
-                    Response::from_string(DM_HTML)
-                        .with_header(html_hdr())
-                        .with_header(cookie_hdr(&token)),
+                    Response::from_string(DM_HTML).with_header(html_hdr()).with_header(cookie_hdr("mh", &token)),
                 );
+            } else if method == Method::Get && path == "/join" && query_token(&url).as_deref() == Some(&token) {
+                let _ = request.respond(join_page(&players, &base).with_header(html_hdr()));
             } else {
                 let _ = request.respond(Response::from_string("unauthorized").with_status_code(401));
             }
             continue;
         }
 
-        match (&method, path) {
+        match (&method, path.as_str()) {
             (Method::Get, "/") => {
                 let _ = request.respond(Response::from_string(DM_HTML).with_header(html_hdr()));
             }
+            (Method::Get, "/join") => {
+                let _ = request.respond(join_page(&players, &base).with_header(html_hdr()));
+            }
             (Method::Get, "/events") => {
-                // long-lived SSE stream; own thread so the accept loop stays live
                 let st = Arc::clone(&state);
                 std::thread::spawn(move || stream_events(request, st));
             }
@@ -74,6 +104,183 @@ pub(crate) fn cmd_serve(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ---------- player surface ----------
+
+fn build_players() -> Result<Players> {
+    let mut by_token = HashMap::new();
+    for slug in sheets::roster() {
+        let token = mint_token()?;
+        by_token.insert(
+            token.clone(),
+            PInfo { slug: slug.clone(), name: sheets::display_name(&slug), token },
+        );
+    }
+    Ok(Players { by_token, ask_log: Mutex::new(HashMap::new()) })
+}
+
+fn route_player(
+    request: tiny_http::Request,
+    method: &Method,
+    seg: &str,
+    url: &str,
+    players: &Arc<Players>,
+    _state: &Arc<Mutex<State>>,
+) {
+    match (method, seg) {
+        // the API routes need the player cookie
+        (Method::Get, "data") => match player_auth(&request, players) {
+            Some(p) => respond_json(request, player_data(&p)),
+            None => reject(request),
+        },
+        (Method::Post, "sheet") => match player_auth(&request, players) {
+            Some(p) => {
+                let st = Arc::clone(players);
+                std::thread::spawn(move || player_sheet(request, &p, &st));
+            }
+            None => reject(request),
+        },
+        (Method::Post, "ask") => match player_auth(&request, players) {
+            Some(p) => {
+                let st = Arc::clone(players);
+                std::thread::spawn(move || player_ask(request, &p, &st));
+            }
+            None => reject(request),
+        },
+        // anything else under /p/ is a capability-token landing
+        (Method::Get, tok) => {
+            let tok = tok.split('?').next().unwrap_or(tok);
+            match players.by_token.get(tok) {
+                Some(_) => {
+                    let _ = request.respond(
+                        Response::from_string(PLAYER_HTML)
+                            .with_header(html_hdr())
+                            .with_header(cookie_hdr("mhp", tok)),
+                    );
+                }
+                None => {
+                    let _ = request.respond(Response::from_string("unknown player link").with_status_code(404));
+                }
+            }
+        }
+        _ => reject(request),
+    }
+    let _ = url; // reserved for future query handling
+}
+
+fn player_auth(request: &tiny_http::Request, players: &Players) -> Option<PInfo> {
+    let tok = cookie_of(request, "mhp")?;
+    players.by_token.get(&tok).cloned()
+}
+
+fn player_data(p: &PInfo) -> Value {
+    let (fields, body) = sheets::read_sheet(&p.slug)
+        .map(|(f, b)| (f, b))
+        .unwrap_or_else(|| (Vec::new(), String::new()));
+    let fields: Vec<Value> = fields
+        .into_iter()
+        .filter(|(k, _)| k != "kind" && k != "player")
+        .map(|(k, v)| {
+            let numeric = v.parse::<i64>().is_ok();
+            json!({ "key": k, "value": v, "numeric": numeric })
+        })
+        .collect();
+    json!({
+        "name": p.name,
+        "has_sheet": !fields.is_empty(),
+        "fields": fields,
+        "body": body,
+        "secrets": sheets::secrets_of(&p.slug),
+        "recap": sheets::latest_recap(),
+    })
+}
+
+fn player_sheet(mut request: tiny_http::Request, p: &PInfo, _players: &Arc<Players>) {
+    let req = read_body(&mut request);
+    let (Some(key), Some(value)) = (req["key"].as_str(), req["value"].as_str()) else {
+        respond_json(request, json!({ "ok": false, "msg": "need key and value" }));
+        return;
+    };
+    match sheets::set_field(&p.slug, key, value) {
+        Ok(saved) => respond_json(request, json!({ "ok": true, "key": key, "value": saved })),
+        Err(e) => respond_json(request, json!({ "ok": false, "msg": e.to_string() })),
+    }
+}
+
+fn player_ask(mut request: tiny_http::Request, p: &PInfo, players: &Arc<Players>) {
+    let req = read_body(&mut request);
+    let question = req["q"].as_str().unwrap_or("").trim().to_string();
+    if question.len() < 3 {
+        respond_json(request, json!({ "ok": false, "answer": "ask a rules or lore question" }));
+        return;
+    }
+    // per-player sliding-hour rate limit — cheap, but a rules-lawyer loop shouldn't run up cost
+    {
+        let mut log = players.ask_log.lock().unwrap();
+        let now = Instant::now();
+        let hits = log.entry(p.slug.clone()).or_default();
+        hits.retain(|t| now.duration_since(*t) < Duration::from_secs(3600));
+        if hits.len() >= ASK_PER_HOUR {
+            drop(log);
+            respond_json(request, json!({ "ok": false, "answer": "you've asked a lot this hour — give the DM a turn" }));
+            return;
+        }
+        hits.push(now);
+    }
+    let result = (|| -> Result<String> {
+        let conn = open_db()?;
+        let llm = llm_config();
+        answer(&conn, &llm, &mut Vec::new(), &question, true) // player=true: spoiler-safe retrieval
+    })();
+    let payload = match result {
+        Ok(a) => json!({ "ok": true, "answer": a }),
+        Err(e) => json!({ "ok": false, "answer": format!("couldn't answer ({e})") }),
+    };
+    respond_json(request, payload);
+}
+
+/// DM-shown page: one QR per player linking to their capability URL.
+fn join_page(players: &Players, base: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut cards = String::new();
+    let mut sorted: Vec<&PInfo> = players.by_token.values().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    for p in sorted {
+        let url = format!("{base}/p/{}", p.token);
+        let qr = qr_svg(&url);
+        cards.push_str(&format!(
+            "<div class=card><h2>{}</h2>{qr}<p class=url>{url}</p></div>",
+            html_escape(&p.name)
+        ));
+    }
+    if cards.is_empty() {
+        cards = "<p>No players yet — add a sheet, backstory, or secret file, then restart serve.</p>".into();
+    }
+    let html = format!(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>\
+         <title>Join — Magehand</title><style>\
+         body{{background:#14131a;color:#ece9f5;font:16px system-ui,sans-serif;margin:0;padding:20px;}}\
+         h1{{font-size:20px;}} .grid{{display:flex;flex-wrap:wrap;gap:20px;}}\
+         .card{{background:#1e1c26;border:1px solid #2c2a38;border-radius:12px;padding:16px;text-align:center;}}\
+         .card h2{{font-size:18px;margin:0 0 10px;}} .card svg{{width:180px;height:180px;background:#fff;border-radius:8px;padding:8px;}}\
+         .url{{color:#8a8699;font-size:11px;word-break:break-all;max-width:196px;margin:8px auto 0;}}\
+         </style><h1>Scan to join — one code per player</h1><div class=grid>{cards}</div>"
+    );
+    Response::from_string(html)
+}
+
+fn qr_svg(data: &str) -> String {
+    use qrcode::render::svg;
+    use qrcode::QrCode;
+    match QrCode::new(data.as_bytes()) {
+        Ok(code) => code
+            .render::<svg::Color>()
+            .min_dimensions(180, 180)
+            .dark_color(svg::Color("#000"))
+            .light_color(svg::Color("#fff"))
+            .build(),
+        Err(_) => "<p>(QR too long)</p>".into(),
+    }
 }
 
 // ---------- shared state ----------
@@ -338,20 +545,34 @@ fn lan_url(port: u16) -> String {
 }
 
 fn authed(request: &tiny_http::Request, token: &str) -> bool {
-    request
+    cookie_of(request, "mh").as_deref() == Some(token)
+}
+
+fn cookie_of(request: &tiny_http::Request, name: &str) -> Option<String> {
+    let raw = request
         .headers()
         .iter()
         .find(|h| h.field.equiv("Cookie"))
-        .map(|h| h.value.as_str())
-        .and_then(|c| cookie_val(c, "mh"))
-        .is_some_and(|v| v == token)
-}
-
-fn cookie_val(cookies: &str, name: &str) -> Option<String> {
-    cookies.split(';').find_map(|kv| {
+        .map(|h| h.value.as_str())?;
+    raw.split(';').find_map(|kv| {
         let (k, v) = kv.trim().split_once('=')?;
         (k == name).then(|| v.to_string())
     })
+}
+
+fn reject(request: tiny_http::Request) {
+    let _ = request.respond(Response::from_string("unauthorized").with_status_code(401));
+}
+
+fn read_body(request: &mut tiny_http::Request) -> Value {
+    let cap = request.body_length().unwrap_or(0).min(MAX_BODY);
+    let mut body = String::new();
+    let _ = request.as_reader().take(cap as u64).read_to_string(&mut body);
+    serde_json::from_str(&body).unwrap_or(Value::Null)
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 fn query_token(url: &str) -> Option<String> {
@@ -374,7 +595,7 @@ fn json_hdr() -> Header {
     header("Content-Type", "application/json")
 }
 
-fn cookie_hdr(token: &str) -> Header {
+fn cookie_hdr(name: &str, token: &str) -> Header {
     // session cookie, host-only; SameSite=Lax so the token in the URL sets it on first load
-    header("Set-Cookie", &format!("mh={token}; Path=/; SameSite=Lax"))
+    header("Set-Cookie", &format!("{name}={token}; Path=/; SameSite=Lax"))
 }

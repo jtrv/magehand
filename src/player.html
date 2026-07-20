@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>Magehand</title>
+<style>
+  :root { --bg:#14131a; --panel:#1e1c26; --edge:#2c2a38; --ink:#ece9f5; --dim:#8a8699; --accent:#5aa9ff; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; }
+  body { background:var(--bg); color:var(--ink);
+    font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    display:flex; flex-direction:column; height:100dvh; }
+  header { padding:12px 16px calc(12px + env(safe-area-inset-top)); border-bottom:1px solid var(--edge);
+    font-weight:650; font-size:18px; }
+  header small { color:var(--dim); font-weight:400; font-size:13px; display:block; }
+  main { flex:1; overflow-y:auto; padding:14px 16px 20px; }
+  .hidden { display:none; }
+  /* sheet */
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .fld { background:var(--panel); border:1px solid var(--edge); border-radius:10px; padding:8px 10px; }
+  .fld .k { color:var(--dim); font-size:12px; text-transform:uppercase; letter-spacing:.03em; }
+  .num { display:flex; align-items:center; gap:8px; margin-top:4px; }
+  .num .v { flex:1; text-align:center; font-size:26px; font-weight:650; font-variant-numeric:tabular-nums; }
+  .num button { width:44px; height:44px; font-size:22px; border:1px solid var(--edge); background:#26232f;
+    color:var(--ink); border-radius:9px; }
+  .fld input { width:100%; margin-top:4px; background:#26232f; border:1px solid var(--edge); color:var(--ink);
+    border-radius:8px; padding:9px; font:inherit; }
+  .body { margin-top:16px; white-space:pre-wrap; color:var(--dim); font-size:14px; }
+  .empty { color:var(--dim); text-align:center; margin-top:40px; }
+  /* ask */
+  #log { display:flex; flex-direction:column; gap:12px; margin-bottom:14px; }
+  .q { align-self:flex-end; background:#2f3b52; border-radius:12px 12px 3px 12px; padding:9px 13px; max-width:85%; }
+  .a { align-self:flex-start; background:var(--panel); border:1px solid var(--edge);
+    border-radius:12px 12px 12px 3px; padding:11px 13px; max-width:92%; white-space:pre-wrap; }
+  .a .foot { color:var(--dim); font-size:12px; margin-top:8px; border-top:1px solid var(--edge); padding-top:6px; }
+  #askbar { position:sticky; bottom:0; display:flex; gap:8px; padding-top:6px; background:var(--bg); }
+  #askbar input { flex:1; background:#26232f; border:1px solid var(--edge); color:var(--ink);
+    border-radius:10px; padding:12px; font:inherit; }
+  #askbar button { border:1px solid var(--accent); background:#2f3b52; color:var(--ink);
+    border-radius:10px; padding:0 18px; font:inherit; }
+  /* stuff */
+  .stuff h3 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--dim); margin:18px 0 8px; }
+  .note { background:var(--panel); border:1px solid var(--edge); border-radius:10px; padding:11px 13px;
+    margin-bottom:8px; white-space:pre-wrap; }
+  .secret { border-left:4px solid #b07bff; }
+  /* tabs */
+  nav { display:flex; border-top:1px solid var(--edge); padding-bottom:env(safe-area-inset-bottom); }
+  nav button { flex:1; background:none; border:none; color:var(--dim); font:inherit; font-size:13px;
+    padding:12px 0 14px; }
+  nav button.on { color:var(--accent); }
+  #toast { position:fixed; bottom:70px; left:50%; transform:translateX(-50%); background:#2f3b52;
+    border:1px solid var(--accent); border-radius:8px; padding:9px 15px; opacity:0; transition:opacity .2s; }
+  #toast.show { opacity:1; }
+</style>
+</head>
+<body>
+  <header id="hdr">…<small>your character</small></header>
+  <main>
+    <section id="sheet"></section>
+    <section id="ask" class="hidden">
+      <div id="log"></div>
+      <div id="askbar"><input id="qbox" placeholder="rules or lore question…" enterkeyhint="send">
+        <button id="qsend">Ask</button></div>
+    </section>
+    <section id="stuff" class="hidden" class="stuff"></section>
+  </main>
+  <nav>
+    <button data-t="sheet" class="on">Sheet</button>
+    <button data-t="ask">Ask</button>
+    <button data-t="stuff">Stuff</button>
+  </nav>
+  <div id="toast"></div>
+<script>
+const $ = s => document.querySelector(s);
+function esc(s){ const d=document.createElement('div'); d.textContent=s??''; return d.innerHTML; }
+function toast(m){ const t=$('#toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2200); }
+
+// tabs
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on', x===b));
+  for(const id of ['sheet','ask','stuff']) $('#'+id).classList.toggle('hidden', id!==b.dataset.t);
+  if(b.dataset.t==='ask') $('#qbox').focus();
+});
+
+let data = null;
+async function load(){
+  const r = await fetch('/p/data'); data = await r.json();
+  $('#hdr').innerHTML = esc(data.name)+'<small>your character</small>';
+  renderSheet(); renderStuff();
+}
+
+function renderSheet(){
+  const el = $('#sheet');
+  if(!data.has_sheet){
+    el.innerHTML = '<p class="empty">No sheet yet.<br>Ask your DM to run<br><code>magehand sheet new '+esc(data.name)+'</code></p>';
+    return;
+  }
+  let h = '<div class="grid">';
+  for(const f of data.fields){
+    if(f.numeric){
+      h += `<div class="fld"><div class="k">${esc(f.key)}</div><div class="num">`+
+        `<button data-k="${esc(f.key)}" data-d="-1">−</button>`+
+        `<span class="v" id="v-${esc(f.key)}">${esc(f.value)}</span>`+
+        `<button data-k="${esc(f.key)}" data-d="1">+</button></div></div>`;
+    } else {
+      h += `<div class="fld" style="grid-column:1/-1"><div class="k">${esc(f.key)}</div>`+
+        `<input data-k="${esc(f.key)}" value="${esc(f.value)}"></div>`;
+    }
+  }
+  h += '</div>';
+  if(data.body) h += `<div class="body">${esc(data.body)}</div>`;
+  el.innerHTML = h;
+  el.querySelectorAll('.num button').forEach(b=>b.onclick=()=>{
+    const span = $('#v-'+CSS.escape(b.dataset.k));
+    const next = (parseInt(span.textContent||'0',10)||0) + (+b.dataset.d);
+    span.textContent = next; save(b.dataset.k, String(next));
+  });
+  el.querySelectorAll('input').forEach(i=>i.onchange=()=>save(i.dataset.k, i.value));
+}
+
+async function save(key, value){
+  try{
+    const r = await fetch('/p/sheet',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key,value})});
+    const j = await r.json();
+    if(!j.ok){ toast(j.msg||'save failed'); }
+  }catch(e){ toast('offline?'); }
+}
+
+function renderStuff(){
+  let h = '';
+  if(data.recap){ h += '<h3>Previously…</h3><div class="note">'+esc(data.recap)+'</div>'; }
+  h += '<h3>Just for you</h3>';
+  if(data.secrets && data.secrets.length)
+    h += data.secrets.map(s=>'<div class="note secret">'+esc(s)+'</div>').join('');
+  else h += '<div class="note" style="color:var(--dim)">Nothing yet.</div>';
+  $('#stuff').innerHTML = h;
+}
+
+// ask
+async function ask(){
+  const box = $('#qbox'); const q = box.value.trim(); if(q.length<3) return;
+  box.value=''; const log=$('#log');
+  log.insertAdjacentHTML('beforeend', `<div class="q">${esc(q)}</div>`);
+  const a = document.createElement('div'); a.className='a'; a.textContent='…'; log.appendChild(a);
+  a.scrollIntoView();
+  try{
+    const r = await fetch('/p/ask',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({q})});
+    const j = await r.json();
+    a.innerHTML = esc(j.answer) + '<div class="foot">Ask your DM to be sure — this isn’t a ruling.</div>';
+  }catch(e){ a.textContent='offline?'; }
+  a.scrollIntoView();
+}
+$('#qsend').onclick = ask;
+$('#qbox').addEventListener('keydown', e=>{ if(e.key==='Enter') ask(); });
+
+load();
+</script>
+</body>
+</html>

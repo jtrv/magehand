@@ -337,7 +337,7 @@ pub(crate) fn ensure_vault() -> Result<()> {
     if !Path::new(crate::SOURCES_DIR).is_dir() {
         return Err("no `sources/` here — run magehand from your campaign directory".into());
     }
-    for d in ["sessions", "npcs", "threads", "recaps", "briefs", "secrets", "backstories", "statblocks"] {
+    for d in ["sessions", "npcs", "threads", "recaps", "briefs", "secrets", "backstories", "statblocks", "sheets"] {
         std::fs::create_dir_all(format!("{CAMPAIGN}/{d}"))?;
     }
     std::fs::create_dir_all("sources/house")?;

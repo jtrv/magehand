@@ -422,7 +422,7 @@ fn label_value(out: &str, label: &str) -> Option<String> {
 // ---------- shared frontmatter helpers ----------
 
 /// Replace `key: …` inside the leading frontmatter block only.
-fn set_fm_line(text: &str, key: &str, value: &str) -> Option<String> {
+pub(crate) fn set_fm_line(text: &str, key: &str, value: &str) -> Option<String> {
     let mut lines = text.split_inclusive('\n');
     let first = lines.next()?;
     if first.trim_end() != "---" {
