@@ -3,6 +3,7 @@ mod improv;
 mod ledger;
 mod listen;
 mod players;
+mod serve;
 mod signals;
 
 use rusqlite::Connection;
@@ -82,6 +83,7 @@ fn main() {
         Some("statblock") if args.len() > 1 => improv::cmd_statblock(&args[1..]),
         Some("listen") => listen::cmd_listen(&args[1..]),
         Some("cards") => signals::cmd_cards(&args[1..]),
+        Some("serve") => serve::cmd_serve(&args[1..]),
         _ => {
             eprintln!("usage: magehand <command> [--player]");
             eprintln!("  ingest                       index everything under sources/");
@@ -111,6 +113,7 @@ fn main() {
             eprintln!("  statblock <name|--stub desc> [--save] play crib or homebrew draft");
             eprintln!("  listen [--stdin] [--shadow]  live table transcript + signal cards; Ctrl-C archives");
             eprintln!("  cards [date]                 review a session's card log (grade shadow runs)");
+            eprintln!("  serve [--port N]             DM dashboard: live card feed + one-tap actions (LAN)");
             eprintln!("  --player                     spoiler-safe retrieval (search/ask/chat)");
             std::process::exit(2);
         }

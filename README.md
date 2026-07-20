@@ -95,7 +95,27 @@ log afterward with `magehand cards`: which would you have wanted mid-game?
 | `MAGEHAND_DIGEST_SECS` | Trigger/fact sweep interval (default 180) |
 | `MAGEHAND_CLOUD_SECRETS` | Opt in to secret detection on a non-local endpoint |
 
-Design and later phases (DM dashboard, player QR pages, sheets): `TABLE-MODE.md`.
+### Phase 3 — the DM dashboard
+
+`magehand serve` puts the card feed on a web page for a tablet propped behind
+the DM screen. Run it alongside `listen` (the card JSONL is the bus between
+them, so a dashboard crash never touches transcription):
+
+```sh
+magehand listen &     # transcribes + emits cards
+magehand serve        # serves the dashboard; prints a tokenized URL
+```
+
+It prints a localhost link and a LAN link, each carrying a **capability token**
+(the page shows secrets, so access is gated — no token, no dashboard, even on
+shared wifi). Open the LAN link on a tablet: three zones — a pinned strip of
+open threads (overdue ones flagged), the live card feed (newest on top, colored
+by type, auto-fading after 5 min), and a transcript ribbon. Each card has
+one-tap actions wired to existing commands: **Save ruling** (rules cards →
+`ruling`), **Open thread** (fact/trigger cards → `thread add`), **Dismiss**.
+Nothing writes to the vault without a tap. `--port N` overrides the default 7979.
+
+Design and later phase (player QR pages, sheets): `TABLE-MODE.md`.
 Start with the MacBook's built-in mics; a $30-60 conference puck (eMeet/TONOR
 class) is the cheap upgrade if a real session's transcript looks rough.
 
