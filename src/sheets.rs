@@ -4,6 +4,11 @@ use crate::{ingest, read_lossy, strip_frontmatter, Result};
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Mutex;
+
+/// Serializes the read-modify-write of a sheet file so concurrent +/- taps
+/// (one player double-tapping, or two players at once) can't lose an update.
+static SHEET_WRITE: Mutex<()> = Mutex::new(());
 
 /// The frontmatter keys a fresh sheet ships with — the ~two dozen numbers that
 /// change at the table. The body below the fence is freeform prose.
@@ -75,6 +80,9 @@ pub(crate) fn set_field(slug: &str, key: &str, value: &str) -> Result<String> {
     if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err("bad field name".into());
     }
+    if matches!(key, "kind" | "player") {
+        return Err("that field can't be edited from the phone".into());
+    }
     let clean = value
         .chars()
         .filter(|c| !c.is_control())
@@ -83,6 +91,11 @@ pub(crate) fn set_field(slug: &str, key: &str, value: &str) -> Result<String> {
         .trim()
         .to_string();
     let path = sheet_path(slug);
+    // No ingest: chunk_markdown strips frontmatter before indexing, so a live HP
+    // tick never touched the search index — reindexing on every tap only invited
+    // "database is locked" from concurrent full rebuilds. The phone reads the
+    // sheet file directly (read_sheet), so the number is always current there.
+    let _guard = SHEET_WRITE.lock().unwrap();
     let text = read_lossy(Path::new(&path))?;
     if !parse_fm(&text).iter().any(|(k, _)| k == key) {
         return Err(format!("no field `{key}` on this sheet").into());
@@ -90,7 +103,6 @@ pub(crate) fn set_field(slug: &str, key: &str, value: &str) -> Result<String> {
     let updated = set_fm_line(&text, key, &clean)
         .ok_or("couldn't update the field (malformed frontmatter?)")?;
     std::fs::write(&path, updated)?;
-    ingest()?;
     Ok(clean)
 }
 
