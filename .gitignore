@@ -1,0 +1,8 @@
+/target
+magehand.db
+/sources
+/.magehand
+/models
+*.bin
+.obsidian
+.DS_Store
