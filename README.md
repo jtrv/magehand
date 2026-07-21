@@ -51,11 +51,13 @@ loot, and downtime entries are stamped with the in-world day automatically.
 
 `magehand listen` transcribes game night into the vault and prints tier-0
 entity cards (NPC/thread/statblock mentions, matched against your own vault —
-no LLM calls during play). **Ctrl-C ends the session**: one LLM cleanup pass
-fixes mishearings using your campaign's proper nouns, then the normal `log`
-canon extraction runs — recap, threads, and contradictions all work as if you'd
-typed session notes. The raw transcript is kept (`sessions/<date>-live.md`,
-excluded from the index) so extraction can be re-run later.
+no LLM calls during play, and reading/saving the transcript never waits on the
+LLM). **Ctrl-C ends the session**: one LLM cleanup pass fixes mishearings using
+your campaign's proper nouns and writes a **reviewable draft** to
+`.magehand/live/<date>-session-draft.md` — nothing enters canon automatically.
+Read the draft, then `magehand log <that path>` promotes it (recap, threads,
+and contradiction checks then work as if you'd typed the notes). The raw
+transcript is kept (`sessions/<date>-live-sNNN.md`, excluded from the index).
 
 Setup (macOS / Apple Silicon):
 

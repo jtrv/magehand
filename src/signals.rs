@@ -278,21 +278,20 @@ impl Listener {
                 card[k] = json!(sanitize(s, cap));
             }
         }
+        // fail closed: a missing or string-typed confidence is treated as 0
+        let conf = card["confidence"]
+            .as_f64()
+            .or_else(|| card["confidence"].as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(0.0);
+        let budget_ok = self.last_print.is_none_or(|t| t.elapsed() >= PRINT_GAP);
+        let live = !self.shadow && (solicited || (conf >= CONFIDENCE_FLOOR && budget_ok));
+        card["live"] = json!(live);
         let _ = self.jsonl.write_all(format!("{card}\n").as_bytes());
-        if self.shadow {
-            return;
-        }
-        if !solicited {
-            // fail closed: a missing or string-typed confidence is treated as 0
-            let conf = card["confidence"]
-                .as_f64()
-                .or_else(|| card["confidence"].as_str().and_then(|s| s.parse().ok()))
-                .unwrap_or(0.0);
-            let budget_ok = self.last_print.is_none_or(|t| t.elapsed() >= PRINT_GAP);
-            if conf < CONFIDENCE_FLOOR || !budget_ok {
+        if !live {
+            if !self.shadow && !solicited {
                 self.suppressed += 1;
-                return;
             }
+            return;
         }
         self.last_print = Some(Instant::now());
         print_card(&card, "  ");

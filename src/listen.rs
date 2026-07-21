@@ -1,4 +1,4 @@
-use crate::campaign::{ensure_vault, last_session_number, log_text, md_files, one_shot, today, CAMPAIGN};
+use crate::campaign::{ensure_vault, last_session_number, md_files, one_shot, today, CAMPAIGN};
 use crate::{read_lossy, strip_frontmatter, Result};
 use std::collections::HashMap;
 use std::fs::File;
@@ -8,6 +8,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::mpsc::TrySendError;
 use std::time::{Duration, Instant};
 
 const DEFAULT_STT_CMD: &str =
@@ -40,7 +41,7 @@ extern "C" fn on_sigint(_: libc::c_int) {
 
 /// Phase 1 of table mode: live transcript into the vault + tier-0 entity cards
 /// on the terminal. Ctrl-C (or EOF) ends the session: one cleanup pass over the
-/// raw ASR text, then the normal `log` canon extraction.
+/// raw ASR text, saved as a draft for human review.
 pub(crate) fn cmd_listen(args: &[String]) -> Result<()> {
     ensure_vault()?;
     let stdin_mode = args.iter().any(|a| a == "--stdin");
@@ -48,7 +49,15 @@ pub(crate) fn cmd_listen(args: &[String]) -> Result<()> {
     let lexicon = build_lexicon();
     let live_path = format!("{CAMPAIGN}/sessions/{}-live.md", today());
     let mut live = open_live(&live_path)?;
-    let mut listener = crate::signals::Listener::new(shadow)?;
+    let listener = crate::signals::Listener::new(shadow)?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(64);
+    let listener_thread = std::thread::spawn(move || {
+        let mut listener = listener;
+        for line in rx {
+            listener.push_line(&line);
+        }
+        listener.finish(STOP.load(Ordering::SeqCst));
+    });
 
     // sigaction without SA_RESTART: a blocked read returns EINTR on Ctrl-C, so
     // even a silent mic (or stdin mode) ends the session on the first press.
@@ -103,6 +112,7 @@ pub(crate) fn cmd_listen(args: &[String]) -> Result<()> {
 
     let started = Instant::now();
     let mut cooldown: HashMap<String, Instant> = HashMap::new();
+    let mut dropped = 0;
     let mut reader = LineReader::new(fd);
     loop {
         match reader.next_line() {
@@ -132,7 +142,11 @@ pub(crate) fn cmd_listen(args: &[String]) -> Result<()> {
                             }
                         }
                     }
-                    listener.push_line(&text);
+                    match tx.try_send(text) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => dropped += 1,
+                        Err(TrySendError::Disconnected(_)) => break,
+                    }
                 }
                 if STOP.load(Ordering::SeqCst) {
                     break;
@@ -140,6 +154,7 @@ pub(crate) fn cmd_listen(args: &[String]) -> Result<()> {
             }
         }
     }
+    drop(tx);
 
     if let Some(mut c) = child {
         let pgid = CHILD_PGID.load(Ordering::SeqCst);
@@ -156,7 +171,12 @@ pub(crate) fn cmd_listen(args: &[String]) -> Result<()> {
             );
         }
     }
-    listener.finish(STOP.load(Ordering::SeqCst));
+    listener_thread.join().map_err(|_| "listener thread panicked")?;
+    if dropped > 0 {
+        println!(
+            "listener fell behind; {dropped} utterance(s) analyzed late/skipped — transcript is complete"
+        );
+    }
     drop(live); // release the transcript lock before finalize re-reads/renames it
     finalize(&live_path, &lexicon)
 }
@@ -172,7 +192,7 @@ fn finalize(live_path: &str, lexicon: &[Entity]) -> Result<()> {
         println!("\ntranscript too short ({words} words of speech) — kept at {live_path}, not archived");
         return Ok(());
     }
-    println!("\narchiving session ({words} words of speech): cleanup pass, then canon extraction…");
+    println!("\npreparing session draft ({words} words of speech): cleanup pass…");
     // ponytail: one big-context call; chunked cleanup if a session ever exceeds this
     let capped: String = if body.len() > 400_000 {
         eprintln!("transcript very large — archiving the last 400k characters");
@@ -192,7 +212,13 @@ fn finalize(live_path: &str, lexicon: &[Entity]) -> Result<()> {
          <transcript>\n{capped}\n</transcript>"
     ))
     .map_err(|e| recovery_err(live_path, &e.to_string()))?;
-    log_text(&cleaned).map_err(|e| recovery_err(live_path, &e.to_string()))?;
+    // draft lives OUTSIDE sources/ so it is NOT indexed as canon until the DM
+    // promotes it — anything under sources/ would get swept in by the next ingest
+    std::fs::create_dir_all(".magehand/live")?;
+    let draft_path = format!(".magehand/live/{}-session-draft.md", today());
+    std::fs::write(&draft_path, cleaned)?;
+    println!("draft notes → {draft_path}");
+    println!("review them, then promote to canon with: magehand log {draft_path}");
     // rotate so a same-day mic test or second session can't re-archive this text
     let rotated = live_path.replace("-live.md", &format!("-live-s{:03}.md", last_session_number()));
     if std::fs::rename(live_path, &rotated).is_ok() {

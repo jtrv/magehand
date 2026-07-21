@@ -85,9 +85,18 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
 
 let data = null;
 async function load(){
-  const r = await fetch('/p/data'); data = await r.json();
-  $('#hdr').innerHTML = esc(data.name)+'<small>your character</small>';
-  renderSheet(); renderStuff();
+  try{
+    const r = await fetch('/p/data');
+    if(!r.ok) throw new Error();
+    data = await r.json();
+    $('#hdr').innerHTML = esc(data.name)+'<small>your character</small>';
+    renderSheet(); renderStuff();
+  }catch(e){
+    $('#hdr').textContent = "couldn't load";
+    $('#sheet').classList.remove('hidden');
+    $('#sheet').innerHTML = '<p class="empty">Couldn’t load — <button id="retry">retry</button></p>';
+    $('#retry').onclick = load;
+  }
 }
 
 function renderSheet(){
@@ -111,12 +120,26 @@ function renderSheet(){
   h += '</div>';
   if(data.body) h += `<div class="body">${esc(data.body)}</div>`;
   el.innerHTML = h;
-  el.querySelectorAll('.num button').forEach(b=>b.onclick=()=>{
+  el.querySelectorAll('.num button').forEach(b=>b.onclick=async()=>{
     const span = $('#v-'+CSS.escape(b.dataset.k));
     const next = (parseInt(span.textContent||'0',10)||0) + (+b.dataset.d);
-    span.textContent = next; save(b.dataset.k, String(next));
+    const buttons = b.closest('.num').querySelectorAll('button');
+    buttons.forEach(x=>x.disabled=true);
+    const saved = await save(b.dataset.k, String(next));
+    if(saved !== null) span.textContent = saved;
+    buttons.forEach(x=>x.disabled=false);
   });
-  el.querySelectorAll('input').forEach(i=>i.onchange=()=>save(i.dataset.k, i.value));
+  el.querySelectorAll('input').forEach(i=>{
+    i.dataset.saved = i.value;
+    i.onchange=async()=>{
+      const value = i.value;
+      i.value = i.dataset.saved;
+      i.disabled = true;
+      const saved = await save(i.dataset.k, value);
+      if(saved !== null) i.value = i.dataset.saved = saved;
+      i.disabled = false;
+    };
+  });
 }
 
 async function save(key, value){
@@ -124,8 +147,9 @@ async function save(key, value){
     const r = await fetch('/p/sheet',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key,value})});
     const j = await r.json();
-    if(!j.ok){ toast(j.msg||'save failed'); }
-  }catch(e){ toast('offline?'); }
+    if(!j.ok){ toast(j.msg||'save failed'); return null; }
+    return String(j.value);
+  }catch(e){ toast('offline?'); return null; }
 }
 
 function renderStuff(){

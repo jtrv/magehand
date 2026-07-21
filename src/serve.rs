@@ -42,7 +42,11 @@ pub(crate) fn cmd_serve(args: &[String]) -> Result<()> {
     let server = Server::http(("0.0.0.0", port))
         .map_err(|e| format!("couldn't bind port {port}: {e}"))?;
 
-    let state = Arc::new(Mutex::new(State::default()));
+    let cards_path = format!("{CARDS_DIR}/cards-{}.jsonl", crate::campaign::today());
+    let processed = read_lossy(Path::new(&cards_path))
+        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0);
+    let state = Arc::new(Mutex::new(State { processed, ..State::default() }));
     spawn_poller(Arc::clone(&state));
     let players = Arc::new(build_players()?);
 
@@ -313,10 +317,12 @@ fn spawn_poller(state: Arc<Mutex<State>>) {
                 let line = lines[st.processed];
                 match serde_json::from_str::<Value>(line) {
                     Ok(card) => {
-                        let id = st.next_id;
-                        st.next_id += 1;
-                        st.log.push(Ev::Card { id, card });
                         st.processed += 1;
+                        if card["live"].as_bool() == Some(true) {
+                            let id = st.next_id;
+                            st.next_id += 1;
+                            st.log.push(Ev::Card { id, card });
+                        }
                     }
                     Err(_) if st.processed == lines.len() - 1 => {
                         break; // last line: likely a partial trailing write, retry next tick
