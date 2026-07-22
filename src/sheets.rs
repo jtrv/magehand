@@ -106,6 +106,26 @@ pub(crate) fn set_field(slug: &str, key: &str, value: &str) -> Result<String> {
     Ok(clean)
 }
 
+/// The player characters as a prompt line — "Mira (Rogue), Brogan (Cleric)" —
+/// so the cleanup/extraction passes can attribute spoken actions to the right
+/// PC (the tool's substitute for speaker diarization). Empty if no PCs known.
+pub(crate) fn player_roster() -> String {
+    roster()
+        .iter()
+        .map(|slug| {
+            let name = display_name(slug);
+            match read_sheet(slug)
+                .and_then(|(fm, _)| fm.into_iter().find(|(k, _)| k == "class").map(|(_, v)| v))
+                .filter(|c| !c.is_empty())
+            {
+                Some(class) => format!("{name} ({class})"),
+                None => name,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Every player the vault knows: anyone with a sheet, backstory, or secret.
 pub(crate) fn roster() -> Vec<String> {
     let mut slugs = BTreeSet::new();

@@ -59,6 +59,16 @@ Read the draft, then `magehand log <that path>` promotes it (recap, threads,
 and contradiction checks then work as if you'd typed the notes). The raw
 transcript is kept (`sessions/<date>-live-sNNN.md`, excluded from the index).
 
+**Who said what:** there are no speaker labels — a single table mic can't
+reliably tell voices apart, and a wrong guess on a per-player secret would leak
+it. Instead the cleanup and canon-extraction passes are primed with your player
+roster (names + classes from `sheets/`/`backstories/`) and attribute an action
+to a character only when the words make it clear — a name is spoken, or the
+action maps to exactly one PC (e.g. a rogue's sneak attack). Ambiguous "I"/"we"
+lines are left unattributed rather than guessed. The tool captures *what
+happened* from content; *who spoke each word* is the DM's own knowledge of the
+room.
+
 Setup (macOS / Apple Silicon):
 
 ```sh
