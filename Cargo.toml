@@ -2,6 +2,9 @@
 name = "magehand"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Local RAG assistant for tabletop RPG game masters: answers rules questions from your own books and tracks campaign state in a plain-markdown vault."
+repository = "https://github.com/jtrv/magehand"
 
 [dependencies]
 libc = "0.2"
