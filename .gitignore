@@ -7,3 +7,9 @@ magehand.db
 .obsidian
 .DS_Store
 token.txt
+
+# Local-only scratch state — never commit.
+.remember/
+.claude/
+CLAUDE.md
+AGENTS.md
