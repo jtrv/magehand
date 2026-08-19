@@ -38,6 +38,11 @@
   #maptoggle { margin-left:auto; cursor:pointer; background:var(--panel); border:1px solid var(--edge);
     border-radius:999px; padding:4px 11px; font-size:14px; color:var(--dim); min-height:0; }
   #maptoggle.on { color:var(--rules); border-color:var(--rules); }
+  #pins .vbtn { cursor:pointer; background:var(--panel); border:1px solid var(--edge);
+    border-radius:999px; padding:4px 11px; font-size:14px; color:var(--dim); min-height:0; }
+  #pins .vbtn.on { color:var(--whisper); border-color:var(--whisper); }
+  #pins .vbtn.muted { color:var(--trigger); border-color:var(--trigger); }
+  #voicepeers { display:contents; }
   #mapview { flex:1; overflow:auto; padding:12px; }
   #mapctl { display:flex; gap:8px; margin-bottom:10px; align-items:center; flex-wrap:wrap; }
   #mapctl input[type=file] { color:var(--dim); font-size:13px; }
@@ -91,7 +96,11 @@
 <body>
   <div id="party"></div>
   <div id="pins"><span class="lbl"><span id="dot"></span>threads</span>
-    <button id="maptoggle">Map</button></div>
+    <button id="maptoggle">Map</button>
+    <button id="voicejoin" class="vbtn">Join voice</button>
+    <button id="voicemute" class="vbtn hidden">Mute</button>
+    <span id="voicepeers"></span>
+    <button id="sessbtn" class="vbtn">Start session</button></div>
   <div id="mapview" class="hidden">
     <div id="mapctl">
       <input type="file" id="mapfile" accept="image/png,image/jpeg,image/webp">
@@ -104,6 +113,7 @@
   <div id="feed"><div id="empty">Waiting for the listener… run <code>magehand listen</code> in another terminal.</div></div>
   <div id="ribbon"><b>heard</b><span id="rib">—</span></div>
   <div id="toast"></div>
+<script src="voice.js"></script>
 <script>
 const feed = document.getElementById('feed');
 const pins = document.getElementById('pins');
@@ -261,7 +271,73 @@ setInterval(()=>{
     el.classList.toggle('faded', now - (+el.dataset.born) > 300000);
 }, 15000);
 
+// ---- voice + session ----
+const vjoin  = document.getElementById('voicejoin');
+const vmute  = document.getElementById('voicemute');
+const vpeers = document.getElementById('voicepeers');
+const sess   = document.getElementById('sessbtn');
+let vjoined = false, vmuted = false;
+
+function renderPeers(list){
+  vpeers.innerHTML = '';
+  for(const p of list){
+    const b = document.createElement('button');
+    b.className = 'vbtn'+(p.muted?' muted':'');
+    b.textContent = (p.muted?'🔇 ':'') + p.id;
+    b.title = p.state + ' — tap to ' + (p.muted?'unmute':'mute');
+    b.onclick = ()=>Voice.mute(p.id, !p.muted);
+    vpeers.append(b);
+  }
+}
+
+vjoin.onclick = async ()=>{
+  if(!vjoined){
+    vjoin.disabled = true;
+    try{
+      await Voice.join('dm', ev, renderPeers);
+      vjoined = true;
+      vjoin.textContent = 'Leave voice'; vjoin.classList.add('on');
+      vmute.classList.remove('hidden');
+    }catch(e){ showToast('mic unavailable'); }
+    vjoin.disabled = false;
+  }else{
+    Voice.leave();
+    vjoined = false; vmuted = false;
+    vjoin.textContent = 'Join voice'; vjoin.classList.remove('on');
+    vmute.textContent = 'Mute'; vmute.classList.remove('on'); vmute.classList.add('hidden');
+    renderPeers([]);
+  }
+};
+vmute.onclick = ()=>{
+  vmuted = !vmuted;
+  Voice.selfMute(vmuted);
+  vmute.textContent = vmuted ? 'Unmute' : 'Mute';
+  vmute.classList.toggle('on', vmuted);
+};
+
+let sessLive = false;
+function renderSession(live){
+  sessLive = live;
+  if(!sess.disabled) sess.textContent = live ? 'End session' : 'Start session';
+  sess.classList.toggle('on', live);
+}
+sess.onclick = async ()=>{
+  const ending = sessLive;
+  if(ending && !confirm('End the session? Wrap-up can take a while.')) return;
+  sess.disabled = true;
+  if(ending) sess.textContent = 'Ending…';
+  try{
+    const r = await fetch('session',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({op: ending?'end':'start'})});
+    const j = await r.json();
+    if(ending || !j.ok) showToast(j.msg || (j.ok?'done':'failed'));
+  }catch(e){ showToast('session action failed'); }
+  sess.disabled = false;
+  sess.textContent = sessLive ? 'End session' : 'Start session';
+};
+
 const ev = new EventSource('events');
+ev.addEventListener('session', e=>renderSession(JSON.parse(e.data).live));
 ev.addEventListener('card',      e=>render(JSON.parse(e.data)));
 ev.addEventListener('dismiss',   e=>dismiss(JSON.parse(e.data).id));
 ev.addEventListener('threads',   e=>renderThreads(JSON.parse(e.data)));
