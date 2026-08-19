@@ -33,6 +33,7 @@ pub(crate) struct Listener {
     secrets_ok: bool,
     triggers: Vec<(String, String)>, // (thread slug, trigger text)
     secrets: String,
+    lexicon: Vec<crate::listen::Entity>,
     window: Vec<String>,
     digest_from: usize,
     digest_every: Duration,
@@ -79,6 +80,7 @@ impl Listener {
             secrets_ok,
             triggers,
             secrets,
+            lexicon: crate::listen::build_lexicon(),
             window: Vec::new(),
             digest_from: 0,
             digest_every,
@@ -89,6 +91,24 @@ impl Listener {
     /// Feed one cleaned utterance. Never lets a listener failure kill the
     /// session — the transcript is the asset; cards are advisory.
     pub(crate) fn push_line(&mut self, text: &str) {
+        // tier-0: deterministic lexicon hits — no model, always logged
+        let norm = crate::listen::normalize(text);
+        let hits: Vec<(String, Value)> = self
+            .lexicon
+            .iter()
+            .filter(|e| norm.contains(&e.needle))
+            .map(|e| {
+                (
+                    e.display.clone(),
+                    json!({ "signal": e.kind, "headline": e.display, "quote": text, "ref": e.path }),
+                )
+            })
+            .collect();
+        for (key, card) in hits {
+            if !self.deduped(&key) {
+                self.emit(card, true);
+            }
+        }
         self.window.push(text.to_string());
         if self.window.len() > WINDOW_CAP {
             let drop = self.window.len() - WINDOW_CAP;

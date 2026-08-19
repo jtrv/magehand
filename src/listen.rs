@@ -1,6 +1,5 @@
 use crate::campaign::{ensure_vault, last_session_number, md_files, one_shot, today, CAMPAIGN};
 use crate::{read_lossy, strip_frontmatter, Result};
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -13,7 +12,6 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_STT_CMD: &str =
     "whisper-stream -m models/ggml-small.en.bin --step 0 --length 8000 -vth 0.6 -t 4";
-const CARD_COOLDOWN: Duration = Duration::from_secs(600);
 const MIN_ARCHIVE_WORDS: usize = 80;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_UTTERANCE_CHARS: usize = 2000;
@@ -111,7 +109,6 @@ pub(crate) fn cmd_listen(args: &[String]) -> Result<()> {
     println!("transcript → {live_path}\n");
 
     let started = Instant::now();
-    let mut cooldown: HashMap<String, Instant> = HashMap::new();
     let mut dropped = 0;
     let mut reader = LineReader::new(fd);
     loop {
@@ -129,19 +126,6 @@ pub(crate) fn cmd_listen(args: &[String]) -> Result<()> {
                 if !text.is_empty() && text.chars().count() <= MAX_UTTERANCE_CHARS {
                     append_line(&mut live, &text)?;
                     println!("… {text}");
-                    let norm = normalize(&text);
-                    for e in &lexicon {
-                        if norm.contains(&e.needle)
-                            && cooldown
-                                .get(&e.display)
-                                .is_none_or(|t| t.elapsed() > CARD_COOLDOWN)
-                        {
-                            cooldown.insert(e.display.clone(), Instant::now());
-                            if !shadow {
-                                println!("  ┌ [{}] {} — {}", e.kind, e.display, e.path);
-                            }
-                        }
-                    }
                     match tx.try_send(text) {
                         Ok(()) => {}
                         Err(TrySendError::Full(_)) => dropped += 1,
@@ -339,10 +323,10 @@ impl LineReader {
 // ---------- lexicon / tier-0 ----------
 
 pub(crate) struct Entity {
-    needle: String,
-    display: String,
-    kind: &'static str,
-    path: String,
+    pub(crate) needle: String,
+    pub(crate) display: String,
+    pub(crate) kind: &'static str,
+    pub(crate) path: String,
 }
 
 /// The vault's own file stems are the tier-0 entity lexicon — a campaign-specific
@@ -389,7 +373,7 @@ pub(crate) fn build_lexicon() -> Vec<Entity> {
 
 /// Lowercase, non-alphanumerics to spaces, collapsed and padded — the matching
 /// space for word-bounded needle checks.
-fn normalize(text: &str) -> String {
+pub(crate) fn normalize(text: &str) -> String {
     let cleaned: String = text
         .to_lowercase()
         .chars()
