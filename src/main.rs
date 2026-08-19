@@ -1,4 +1,5 @@
 mod campaign;
+mod host;
 mod improv;
 mod ledger;
 mod listen;
@@ -85,6 +86,7 @@ fn main() {
         Some("listen") => listen::cmd_listen(&args[1..]),
         Some("cards") => signals::cmd_cards(&args[1..]),
         Some("serve") => serve::cmd_serve(&args[1..]),
+        Some("host") => host::cmd_host(&args[1..]),
         Some("sheet") => sheets::cmd_sheet(&args[1..]),
         _ => {
             eprintln!("usage: magehand <command> [--player]");
@@ -115,7 +117,8 @@ fn main() {
             eprintln!("  statblock <name|--stub desc> [--save] play crib or homebrew draft");
             eprintln!("  listen [--stdin] [--shadow]  live table transcript + signal cards; Ctrl-C archives");
             eprintln!("  cards [date]                 review a session's card log (grade shadow runs)");
-            eprintln!("  serve [--port N]             DM dashboard + player pages (LAN); prints QR join page");
+            eprintln!("  serve [--port N] [--public-base URL]  DM dashboard + player pages; prints QR join page");
+            eprintln!("  host [new <name>] [--data-dir D] [--public-url U]  run every campaign under D (one serve each)");
             eprintln!("  sheet new <player>           scaffold a character sheet; `sheet import <player>` from pasted text");
             eprintln!("  --player                     spoiler-safe retrieval (search/ask/chat)");
             std::process::exit(2);
