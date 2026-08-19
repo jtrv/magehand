@@ -57,9 +57,20 @@ rtc_relay stamps `from` server-side; `to:'*'` fans to all rostered slugs ≠ sen
 sender isn't DM); collect slugs BEFORE locking State (lock-order). RUSTC_WRAPPER="" for all
 cargo invocations on this machine.
 
+- [x] 6. IC/OOC inference + advisory OOC toggle: (a) voice-bar OOC toggle on both pages
+      (X-OOC header on audio POSTs → transcript line `Name (ooc): text`) — an AID for the
+      classifier, never a hard filter; (b) finalize's labeled-mode prompt classifies each
+      utterance {in-character dialogue → quoted script line, with DM lines attributed to
+      the named NPC when context makes it clear; action → terse bullet; mechanics → keep
+      only outcome-changing; ooc → drop}, with (ooc) markers weighted as strong hints that
+      content can override in both directions. Acceptance: verify passes; e2e fixture
+      extended with one OOC-flagged post asserting the `(ooc)` marker lands in the
+      transcript. Commit as `feat: ic/ooc classification + advisory ooc toggle`.
+
 ### Log
 - 2026-08-18 T1 feat ×2 (700d6ba hosting shell, a9624ee online play core) — verify clean first run
 - 2026-08-18 T2 feat (f917151 voice/session controls both pages) — verify clean
 - 2026-08-18 T3 fix (ff50e33 entity cards emitted from Listener::push_line, both paths) — e2e script ALL PASS ×2
 - 2026-08-18 T5 docs (5710012 README online play, TABLE-MODE addendum, gitignore/cleanup) — verify clean
 - 2026-08-18 T4 fix (aa6d134 nine codex-review hardening fixes) — 10 findings: 9 fixed, 1 reshaped (silent transcription failure → throttled DM card instead of retry queue); fixture ALL PASS
+- 2026-08-19 T6 feat (b1173af ic/ooc classification + advisory ooc toggle) — fixture ALL PASS incl. (ooc) marker assert
