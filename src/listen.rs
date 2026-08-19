@@ -178,10 +178,10 @@ pub(crate) fn cmd_listen(args: &[String]) -> Result<()> {
         );
     }
     drop(live); // release the transcript lock before finalize re-reads/renames it
-    finalize(&live_path, &lexicon)
+    finalize(&live_path, &lexicon, false)
 }
 
-fn finalize(live_path: &str, lexicon: &[Entity]) -> Result<()> {
+pub(crate) fn finalize(live_path: &str, lexicon: &[Entity], labeled: bool) -> Result<()> {
     let Ok(raw) = read_lossy(Path::new(live_path)) else {
         println!("\nno transcript captured");
         return Ok(());
@@ -204,7 +204,12 @@ fn finalize(live_path: &str, lexicon: &[Entity]) -> Result<()> {
     // roster-primed attribution — the transcript has no speaker labels, so the
     // model resolves "who acted" from the words plus the known cast
     let roster = crate::sheets::player_roster();
-    let who = if roster.is_empty() {
+    let who = if labeled {
+        // online mode: every line already carries its speaker (one mic per player)
+        "Each line is prefixed with the speaker's name — trust these labels when \
+         attributing actions. "
+            .to_string()
+    } else if roster.is_empty() {
         String::new()
     } else {
         format!(
@@ -333,7 +338,7 @@ impl LineReader {
 
 // ---------- lexicon / tier-0 ----------
 
-struct Entity {
+pub(crate) struct Entity {
     needle: String,
     display: String,
     kind: &'static str,
@@ -342,7 +347,7 @@ struct Entity {
 
 /// The vault's own file stems are the tier-0 entity lexicon — a campaign-specific
 /// NER model the DM maintains just by writing markdown.
-fn build_lexicon() -> Vec<Entity> {
+pub(crate) fn build_lexicon() -> Vec<Entity> {
     let stop = ["the", "and", "for", "from", "with", "that", "this", "into"];
     let mut seen = std::collections::HashSet::new();
     let mut v = Vec::new();
@@ -395,7 +400,7 @@ fn normalize(text: &str) -> String {
 
 /// Proper nouns for STT hotwording ({names} in MAGEHAND_STT_CMD) and the
 /// cleanup pass — capped so it stays a prompt, not a payload.
-fn hotword_names(lexicon: &[Entity]) -> String {
+pub(crate) fn hotword_names(lexicon: &[Entity]) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut out = String::new();
     for e in lexicon {
@@ -414,7 +419,7 @@ fn hotword_names(lexicon: &[Entity]) -> String {
 
 // ---------- live file ----------
 
-fn open_live(path: &str) -> Result<File> {
+pub(crate) fn open_live(path: &str) -> Result<File> {
     let is_new = !Path::new(path).exists();
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     // one listener per transcript — a second concurrent process would tear lines
@@ -427,7 +432,7 @@ fn open_live(path: &str) -> Result<File> {
     Ok(f)
 }
 
-fn append_line(f: &mut File, text: &str) -> Result<()> {
+pub(crate) fn append_line(f: &mut File, text: &str) -> Result<()> {
     // single write_all per line: concurrent readers (tail, Obsidian) never see
     // a torn line even mid-write
     f.write_all(format!("- [{}] {text}\n", now_hms()).as_bytes())?;
@@ -439,7 +444,7 @@ fn append_line(f: &mut File, text: &str) -> Result<()> {
 
 /// Strip terminal escapes (CSI, OSC, charset selects), whisper timestamps, and
 /// status/noise lines; keep speech.
-fn clean_stt_line(raw: &str) -> String {
+pub(crate) fn clean_stt_line(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {

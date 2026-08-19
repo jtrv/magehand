@@ -13,15 +13,25 @@ use tiny_http::{Header, Method, Response, Server};
 const CARDS_DIR: &str = ".magehand/live";
 const DM_HTML: &str = include_str!("dm.html");
 const PLAYER_HTML: &str = include_str!("player.html");
+const VOICE_JS: &str = include_str!("voice.js");
 const POLL: Duration = Duration::from_millis(700);
 const MAX_BODY: usize = 16 * 1024;
 const ASK_PER_HOUR: usize = 12;
+const ASK_PER_DAY: usize = 150; // per campaign — hosted means the host pays the table's LLM bill
+const MAX_IMAGE: usize = 8 * 1024 * 1024;
+const MAX_WAV: usize = 2 * 1024 * 1024; // ~60s of 16kHz PCM16 — one gated utterance
+const PIN_TRIES_PER_HOUR: usize = 5;
+const TOKENS_PATH: &str = ".magehand/tokens.json";
 
-/// Player roster + capability tokens (immutable after startup) and per-player
-/// ask rate limiting.
+/// Player roster + capability tokens (mutable: the DM can regenerate a leaked
+/// link), per-player ask rate limiting, a campaign-wide daily ask cap, and
+/// PIN-attempt throttling.
 struct Players {
-    by_token: HashMap<String, PInfo>,
+    by_token: Mutex<HashMap<String, PInfo>>,
+    dm_token: String,
     ask_log: Mutex<HashMap<String, Vec<Instant>>>,
+    campaign_asks: Mutex<Vec<Instant>>,
+    pin_log: Mutex<HashMap<String, Vec<Instant>>>,
 }
 
 #[derive(Clone)]
@@ -29,6 +39,20 @@ struct PInfo {
     slug: String,
     name: String,
     token: String,
+    /// Empty until the player's first claim. Stored plaintext: the threat model
+    /// is a leaked join link, not the DM (who owns the vault file anyway) —
+    /// the real defense is PIN_TRIES_PER_HOUR.
+    pin: String,
+}
+
+/// Where this server is reachable from a browser. Standalone LAN serve: the
+/// LAN URL with an empty path prefix. Behind `magehand host` + caddy: the
+/// public https URL with a `/c/<slug>` prefix (caddy strips it before us, so
+/// the prefix only appears in cookies, redirects, and join links).
+struct Base {
+    url: String,
+    path: String,
+    secure: bool,
 }
 
 /// Phase 3 of table mode: the DM dashboard. A LAN web page (token-gated, since
@@ -38,25 +62,29 @@ struct PInfo {
 pub(crate) fn cmd_serve(args: &[String]) -> Result<()> {
     ensure_vault()?;
     let port: u16 = arg_val(args, "--port").and_then(|v| v.parse().ok()).unwrap_or(7979);
-    let token = mint_token()?;
     let server = Server::http(("0.0.0.0", port))
         .map_err(|e| format!("couldn't bind port {port}: {e}"))?;
 
+    let base = Arc::new(build_base(args, port));
     let cards_path = format!("{CARDS_DIR}/cards-{}.jsonl", crate::campaign::today());
     let processed = read_lossy(Path::new(&cards_path))
         .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
         .unwrap_or(0);
-    let state = Arc::new(Mutex::new(State { processed, ..State::default() }));
+    let state = Arc::new(Mutex::new(State {
+        processed,
+        map_json: map_state().to_string(),
+        ..State::default()
+    }));
     spawn_poller(Arc::clone(&state));
-    let players = Arc::new(build_players()?);
+    let (players, token) = build_players()?;
+    let players = Arc::new(players);
 
-    let base = lan_url(port);
     println!("magehand table server\n");
-    println!("  DM dashboard (shows secrets):  {base}/?t={token}");
-    println!("  player join page (QR codes):   {base}/join?t={token}");
+    println!("  DM dashboard (shows secrets):  {}/?t={token}", base.url);
+    println!("  player join page (QR codes):   {}/join?t={token}", base.url);
     println!(
         "\n{} player(s) rostered. Open the join page on the DM laptop and let players scan.",
-        players.by_token.len()
+        players.by_token.lock().unwrap().len()
     );
     println!("run `magehand listen` alongside this to feed the card feed. Ctrl-C to stop.");
 
@@ -67,18 +95,22 @@ pub(crate) fn cmd_serve(args: &[String]) -> Result<()> {
 
         // --- player routes (own capability cookie, scoped to one player) ---
         if let Some(seg) = path.strip_prefix("/p/") {
-            route_player(request, &method, seg, &url, &players, &state);
+            route_player(request, &method, seg, &players, &state, &base);
             continue;
         }
 
         // --- DM routes (require the DM token) ---
         if !authed(&request, &token) {
-            if method == Method::Get && path == "/" && query_token(&url).as_deref() == Some(&token) {
+            if method == Method::Get
+                && (path == "/" || path == "/join")
+                && query_token(&url).as_deref() == Some(&token)
+            {
+                // set the cookie, then bounce to a clean URL so the token stays
+                // out of history, screenshots, and proxy logs
                 let _ = request.respond(
-                    Response::from_string(DM_HTML).with_header(html_hdr()).with_header(cookie_hdr("mh", &token)),
+                    redirect(&format!("{}{path}", base.path))
+                        .with_header(cookie_hdr("mh", &token, &base)),
                 );
-            } else if method == Method::Get && path == "/join" && query_token(&url).as_deref() == Some(&token) {
-                let _ = request.respond(join_page(&players, &base).with_header(html_hdr()));
             } else {
                 let _ = request.respond(Response::from_string("unauthorized").with_status_code(401));
             }
@@ -87,10 +119,10 @@ pub(crate) fn cmd_serve(args: &[String]) -> Result<()> {
 
         match (&method, path.as_str()) {
             (Method::Get, "/") => {
-                let _ = request.respond(Response::from_string(DM_HTML).with_header(html_hdr()));
+                let _ = request.respond(Response::from_string(DM_HTML).with_header(html_hdr()).with_header(nostore_hdr()));
             }
             (Method::Get, "/join") => {
-                let _ = request.respond(join_page(&players, &base).with_header(html_hdr()));
+                let _ = request.respond(join_page(&players, &base.url).with_header(html_hdr()).with_header(nostore_hdr()));
             }
             (Method::Get, "/events") => {
                 let st = Arc::clone(&state);
@@ -102,6 +134,39 @@ pub(crate) fn cmd_serve(args: &[String]) -> Result<()> {
                 let st = Arc::clone(&state);
                 std::thread::spawn(move || handle_action(request, st));
             }
+            (Method::Post, "/regen") => {
+                regen_link(request, &players, &token, &base);
+            }
+            (Method::Get, "/voice.js") => {
+                let _ = request.respond(
+                    Response::from_string(VOICE_JS)
+                        .with_header(header("Content-Type", "application/javascript"))
+                        .with_header(nostore_hdr()),
+                );
+            }
+            (Method::Get, "/rtc-config") => respond_json(request, rtc_config()),
+            (Method::Post, "/rtc") => {
+                let st = Arc::clone(&state);
+                let pl = Arc::clone(&players);
+                std::thread::spawn(move || rtc_relay(request, "dm", &pl, &st));
+            }
+            (Method::Post, "/audio") => {
+                let st = Arc::clone(&state);
+                std::thread::spawn(move || post_audio(request, "DM".into(), &st));
+            }
+            (Method::Post, "/session") => {
+                let st = Arc::clone(&state);
+                std::thread::spawn(move || session_ctl(request, &st));
+            }
+            (Method::Get, "/map/image") => serve_map_image(request),
+            (Method::Post, "/map/image") => {
+                let st = Arc::clone(&state);
+                std::thread::spawn(move || upload_map_image(request, &st));
+            }
+            (Method::Post, "/map/token") => {
+                let st = Arc::clone(&state);
+                std::thread::spawn(move || dm_map_token(request, &st));
+            }
             _ => {
                 let _ = request.respond(Response::from_string("not found").with_status_code(404));
             }
@@ -110,29 +175,93 @@ pub(crate) fn cmd_serve(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-// ---------- player surface ----------
+fn build_base(args: &[String], port: u16) -> Base {
+    match arg_val(args, "--public-base") {
+        Some(url) => {
+            let url = url.trim_end_matches('/').to_string();
+            let path = url
+                .split_once("://")
+                .and_then(|(_, rest)| rest.find('/').map(|i| rest[i..].to_string()))
+                .unwrap_or_default();
+            let secure = url.starts_with("https://");
+            Base { url, path, secure }
+        }
+        None => Base { url: lan_url(port), path: String::new(), secure: false },
+    }
+}
 
-fn build_players() -> Result<Players> {
+fn redirect(location: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    Response::from_string("").with_status_code(303).with_header(header("Location", location))
+}
+
+// ---------- token store ----------
+
+/// Tokens persist across restarts (`.magehand/tokens.json`): hosted join links
+/// live in players' phones for a whole campaign, so a restart must not orphan
+/// them. New roster members get minted in; departed slugs are dropped.
+fn build_players() -> Result<(Players, String)> {
+    let saved = read_lossy(Path::new(TOKENS_PATH))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .unwrap_or(Value::Null);
+    let dm_token = match saved["dm"].as_str() {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => mint_token()?,
+    };
     let mut by_token = HashMap::new();
     for slug in sheets::roster() {
-        let token = mint_token()?;
+        let (token, pin) = match saved["players"][&slug].as_object() {
+            Some(o) => (
+                o.get("token").and_then(Value::as_str).unwrap_or_default().to_string(),
+                o.get("pin").and_then(Value::as_str).unwrap_or_default().to_string(),
+            ),
+            None => (String::new(), String::new()),
+        };
+        let token = if token.is_empty() { mint_token()? } else { token };
         by_token.insert(
             token.clone(),
-            PInfo { slug: slug.clone(), name: sheets::display_name(&slug), token },
+            PInfo { slug: slug.clone(), name: sheets::display_name(&slug), token, pin },
         );
     }
-    Ok(Players { by_token, ask_log: Mutex::new(HashMap::new()) })
+    save_tokens(&dm_token, &by_token)?;
+    let players = Players {
+        by_token: Mutex::new(by_token),
+        dm_token: dm_token.clone(),
+        ask_log: Mutex::new(HashMap::new()),
+        campaign_asks: Mutex::new(Vec::new()),
+        pin_log: Mutex::new(HashMap::new()),
+    };
+    Ok((players, dm_token))
 }
+
+fn save_tokens(dm: &str, by_token: &HashMap<String, PInfo>) -> Result<()> {
+    let players: serde_json::Map<String, Value> = by_token
+        .values()
+        .map(|p| (p.slug.clone(), json!({ "token": p.token, "pin": p.pin })))
+        .collect();
+    std::fs::create_dir_all(".magehand")?;
+    std::fs::write(TOKENS_PATH, json!({ "dm": dm, "players": players }).to_string())?;
+    Ok(())
+}
+
+// ---------- player surface ----------
 
 fn route_player(
     request: tiny_http::Request,
     method: &Method,
     seg: &str,
-    url: &str,
     players: &Arc<Players>,
-    _state: &Arc<Mutex<State>>,
+    state: &Arc<Mutex<State>>,
+    base: &Arc<Base>,
 ) {
     match (method, seg) {
+        // the app page itself; fetches from it are relative, so they resolve under /p/
+        (Method::Get, "") => match player_auth(&request, players) {
+            Some(_) => {
+                let _ = request.respond(Response::from_string(PLAYER_HTML).with_header(html_hdr()).with_header(nostore_hdr()));
+            }
+            None => reject(request),
+        },
         // the API routes need the player cookie
         (Method::Get, "data") => match player_auth(&request, players) {
             Some(p) => respond_json(request, player_data(&p)),
@@ -152,16 +281,69 @@ fn route_player(
             }
             None => reject(request),
         },
-        // anything else under /p/ is a capability-token landing
+        (Method::Get, "events") => match player_auth(&request, players) {
+            Some(p) => {
+                let st = Arc::clone(state);
+                std::thread::spawn(move || stream_player(request, &st, &p.slug));
+            }
+            None => reject(request),
+        },
+        (Method::Post, "msg") => match player_auth(&request, players) {
+            Some(p) => {
+                let st = Arc::clone(state);
+                std::thread::spawn(move || player_msg(request, &p, &st));
+            }
+            None => reject(request),
+        },
+        (Method::Get, "voice.js") => match player_auth(&request, players) {
+            Some(_) => {
+                let _ = request.respond(
+                    Response::from_string(VOICE_JS)
+                        .with_header(header("Content-Type", "application/javascript"))
+                        .with_header(nostore_hdr()),
+                );
+            }
+            None => reject(request),
+        },
+        (Method::Get, "rtc-config") => match player_auth(&request, players) {
+            Some(_) => respond_json(request, rtc_config()),
+            None => reject(request),
+        },
+        (Method::Post, "rtc") => match player_auth(&request, players) {
+            Some(p) => {
+                let st = Arc::clone(state);
+                let pl = Arc::clone(players);
+                std::thread::spawn(move || rtc_relay(request, &p.slug, &pl, &st));
+            }
+            None => reject(request),
+        },
+        (Method::Post, "audio") => match player_auth(&request, players) {
+            Some(p) => {
+                let st = Arc::clone(state);
+                std::thread::spawn(move || post_audio(request, p.name, &st));
+            }
+            None => reject(request),
+        },
+        (Method::Get, "map-image") => match player_auth(&request, players) {
+            Some(_) => serve_map_image(request),
+            None => reject(request),
+        },
+        (Method::Post, "token") => match player_auth(&request, players) {
+            Some(p) => {
+                let st = Arc::clone(state);
+                std::thread::spawn(move || player_map_token(request, &p, &st));
+            }
+            None => reject(request),
+        },
+        (Method::Post, "claim") => player_claim(request, players, base),
+        // anything else under /p/ is a capability-token landing → PIN gate
         (Method::Get, tok) => {
-            let tok = tok.split('?').next().unwrap_or(tok);
-            match players.by_token.get(tok) {
-                Some(_) => {
-                    let _ = request.respond(
-                        Response::from_string(PLAYER_HTML)
-                            .with_header(html_hdr())
-                            .with_header(cookie_hdr("mhp", tok)),
-                    );
+            let tok = tok.split('?').next().unwrap_or(tok).to_string();
+            let known = { players.by_token.lock().unwrap().get(&tok).cloned() };
+            match known {
+                Some(p) => {
+                    let _ = request
+                        .respond(Response::from_string(claim_page(&p, "")).with_header(html_hdr()).with_header(nostore_hdr()));
                 }
                 None => {
                     let _ = request.respond(Response::from_string("unknown player link").with_status_code(404));
@@ -170,18 +352,127 @@ fn route_player(
         }
         _ => reject(request),
     }
-    let _ = url; // reserved for future query handling
+}
+
+/// The PIN gate between a join link and the cookie. First visit sets the PIN;
+/// later visits (new device, or someone else holding a leaked link) must match
+/// it. Attempts are throttled per token — that, not PIN secrecy, is the defense.
+fn player_claim(mut request: tiny_http::Request, players: &Arc<Players>, base: &Arc<Base>) {
+    let mut body = String::new();
+    let cap = request.body_length().unwrap_or(0).min(MAX_BODY);
+    let _ = request.as_reader().take(cap as u64).read_to_string(&mut body);
+    let field = |k: &str| {
+        body.split('&').find_map(|kv| {
+            let (key, v) = kv.split_once('=')?;
+            (key == k).then(|| v.to_string())
+        })
+    };
+    let (Some(tok), Some(pin)) = (field("token"), field("pin")) else {
+        let _ = request.respond(Response::from_string("bad claim").with_status_code(400));
+        return;
+    };
+    {
+        let mut log = players.pin_log.lock().unwrap();
+        let now = Instant::now();
+        let hits = log.entry(tok.clone()).or_default();
+        hits.retain(|t| now.duration_since(*t) < Duration::from_secs(3600));
+        if hits.len() >= PIN_TRIES_PER_HOUR {
+            let _ = request
+                .respond(Response::from_string("too many tries — wait an hour").with_status_code(429));
+            return;
+        }
+        hits.push(now);
+    }
+    let mut map = players.by_token.lock().unwrap();
+    let Some(p) = map.get(&tok).cloned() else {
+        let _ = request.respond(Response::from_string("unknown player link").with_status_code(404));
+        return;
+    };
+    if !(4..=6).contains(&pin.len()) || !pin.chars().all(|c| c.is_ascii_digit()) {
+        let page = claim_page(&p, "PIN must be 4–6 digits");
+        let _ = request.respond(Response::from_string(page).with_header(html_hdr()).with_header(nostore_hdr()));
+        return;
+    }
+    if p.pin.is_empty() {
+        map.get_mut(&tok).expect("lock held since fetch").pin = pin;
+        let _ = save_tokens(&players.dm_token, &map);
+    } else if p.pin != pin {
+        let page = claim_page(&p, "wrong PIN — try again");
+        let _ = request.respond(Response::from_string(page).with_header(html_hdr()).with_header(nostore_hdr()));
+        return;
+    }
+    drop(map);
+    let _ = request.respond(
+        redirect(&format!("{}/p/", base.path)).with_header(cookie_hdr("mhp", &tok, base)),
+    );
+}
+
+fn claim_page(p: &PInfo, error: &str) -> String {
+    let (title, hint) = if p.pin.is_empty() {
+        ("Choose a PIN", "Pick a 4-digit PIN. You'll need it if you open your link on another device.")
+    } else {
+        ("Enter your PIN", "This link was already claimed — enter the PIN you chose.")
+    };
+    let err = if error.is_empty() { String::new() } else { format!("<p class=err>{}</p>", html_escape(error)) };
+    format!(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>\
+         <title>{title} — Magehand</title><style>\
+         body{{background:#14131a;color:#ece9f5;font:16px system-ui,sans-serif;margin:0;display:grid;place-items:center;min-height:100dvh;}}\
+         form{{background:#1e1c26;border:1px solid #2c2a38;border-radius:12px;padding:24px;max-width:320px;text-align:center;}}\
+         h1{{font-size:20px;margin:0 0 6px;}} p{{color:#8a8699;font-size:14px;}} .err{{color:#e07777;}}\
+         input{{font-size:24px;text-align:center;letter-spacing:6px;width:9ch;background:#14131a;color:#ece9f5;\
+         border:1px solid #2c2a38;border-radius:8px;padding:8px;}}\
+         button{{display:block;margin:16px auto 0;font-size:16px;padding:8px 24px;border-radius:8px;border:0;\
+         background:#7c6cd0;color:#fff;}}</style>\
+         <form method=post action=claim>\
+         <h1>{} — {title}</h1><p>{hint}</p>{err}\
+         <input name=pin inputmode=numeric pattern='[0-9]*' maxlength=6 autofocus autocomplete=off>\
+         <input type=hidden name=token value='{}'>\
+         <button>Join</button></form>",
+        html_escape(&p.name),
+        p.token,
+    )
+}
+
+/// DM action: re-mint one player's join link (leaked screenshot, wrong Discord
+/// channel…). The PIN survives — it's the same player, new capability URL.
+fn regen_link(mut request: tiny_http::Request, players: &Arc<Players>, dm_token: &str, base: &Arc<Base>) {
+    let req = read_body(&mut request);
+    let Some(slug) = req["slug"].as_str() else {
+        respond_json(request, json!({ "ok": false, "msg": "need slug" }));
+        return;
+    };
+    let Ok(new_tok) = mint_token() else {
+        respond_json(request, json!({ "ok": false, "msg": "couldn't mint token" }));
+        return;
+    };
+    let mut map = players.by_token.lock().unwrap();
+    let Some(old) = map.values().find(|p| p.slug == slug).map(|p| p.token.clone()) else {
+        respond_json(request, json!({ "ok": false, "msg": "no such player" }));
+        return;
+    };
+    let mut p = map.remove(&old).expect("just found");
+    p.token = new_tok.clone();
+    map.insert(new_tok.clone(), p);
+    let saved = save_tokens(dm_token, &map);
+    drop(map);
+    match saved {
+        Ok(()) => respond_json(
+            request,
+            json!({ "ok": true, "msg": "old link is dead", "url": format!("{}/p/{new_tok}", base.url) }),
+        ),
+        Err(e) => respond_json(request, json!({ "ok": false, "msg": e.to_string() })),
+    }
 }
 
 fn player_auth(request: &tiny_http::Request, players: &Players) -> Option<PInfo> {
     let tok = cookie_of(request, "mhp")?;
-    players.by_token.get(&tok).cloned()
+    players.by_token.lock().unwrap().get(&tok).cloned()
 }
 
 fn player_data(p: &PInfo) -> Value {
-    let (fields, body) = sheets::read_sheet(&p.slug)
-        .map(|(f, b)| (f, b))
-        .unwrap_or_else(|| (Vec::new(), String::new()));
+    let (fields, body) =
+        sheets::read_sheet(&p.slug).unwrap_or_else(|| (Vec::new(), String::new()));
     let fields: Vec<Value> = fields
         .into_iter()
         .filter(|(k, _)| k != "kind" && k != "player")
@@ -192,11 +483,13 @@ fn player_data(p: &PInfo) -> Value {
         .collect();
     json!({
         "name": p.name,
+        "slug": p.slug,
         "has_sheet": !fields.is_empty(),
         "fields": fields,
         "body": body,
         "secrets": sheets::secrets_of(&p.slug),
         "recap": sheets::latest_recap(),
+        "messages": msgs_for(&p.slug),
     })
 }
 
@@ -232,6 +525,18 @@ fn player_ask(mut request: tiny_http::Request, p: &PInfo, players: &Arc<Players>
         }
         hits.push(now);
     }
+    // campaign-wide sliding-day cap — one table can't drain the host's LLM key
+    {
+        let mut asks = players.campaign_asks.lock().unwrap();
+        let now = Instant::now();
+        asks.retain(|t| now.duration_since(*t) < Duration::from_secs(86_400));
+        if asks.len() >= ASK_PER_DAY {
+            drop(asks);
+            respond_json(request, json!({ "ok": false, "answer": "the table hit today's question budget — ask your DM" }));
+            return;
+        }
+        asks.push(now);
+    }
     let result = (|| -> Result<String> {
         let conn = open_db()?;
         let llm = llm_config();
@@ -244,10 +549,271 @@ fn player_ask(mut request: tiny_http::Request, p: &PInfo, players: &Arc<Players>
     respond_json(request, payload);
 }
 
+// ---------- map ----------
+
+/// Serializes read-modify-write of maps/state.json (two token drags landing at
+/// once must not lose one), mirroring the SHEET_WRITE idiom in sheets.rs.
+static MAP_WRITE: Mutex<()> = Mutex::new(());
+
+fn map_dir() -> String {
+    format!("{CAMPAIGN}/maps")
+}
+
+fn map_state() -> Value {
+    read_lossy(Path::new(&format!("{}/state.json", map_dir())))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| json!({ "image": Value::Null, "v": 0, "tokens": [] }))
+}
+
+fn mutate_map(
+    state: &Arc<Mutex<State>>,
+    f: impl FnOnce(&mut Value) -> Result<()>,
+) -> Result<()> {
+    let _guard = MAP_WRITE.lock().unwrap();
+    let mut map = map_state();
+    f(&mut map)?;
+    std::fs::create_dir_all(map_dir())?;
+    std::fs::write(format!("{}/state.json", map_dir()), map.to_string())?;
+    state.lock().unwrap().map_json = map.to_string();
+    Ok(())
+}
+
+/// The image filename is always server-authored (`current.<ext>`) — clients
+/// never send a path, so there is nothing to traverse.
+fn serve_map_image(request: tiny_http::Request) {
+    let map = map_state();
+    let Some(name) = map["image"].as_str() else {
+        let _ = request.respond(Response::from_string("no map yet").with_status_code(404));
+        return;
+    };
+    let ct = match name.rsplit('.').next() {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        _ => "image/jpeg",
+    };
+    match std::fs::read(format!("{}/{name}", map_dir())) {
+        Ok(bytes) => {
+            let _ = request.respond(Response::from_data(bytes).with_header(header("Content-Type", ct)));
+        }
+        Err(_) => {
+            let _ = request.respond(Response::from_string("no map file").with_status_code(404));
+        }
+    }
+}
+
+fn upload_map_image(mut request: tiny_http::Request, state: &Arc<Mutex<State>>) {
+    let ct = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Type"))
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default();
+    let ext = match ct.as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => {
+            respond_json(request, json!({ "ok": false, "msg": "png, jpeg, or webp only" }));
+            return;
+        }
+    };
+    let len = request.body_length().unwrap_or(0);
+    if len == 0 || len > MAX_IMAGE {
+        respond_json(request, json!({ "ok": false, "msg": "image must be under 8 MB" }));
+        return;
+    }
+    let mut buf = Vec::with_capacity(len);
+    if request.as_reader().take(MAX_IMAGE as u64).read_to_end(&mut buf).is_err() {
+        respond_json(request, json!({ "ok": false, "msg": "upload failed" }));
+        return;
+    }
+    let result = mutate_map(state, |map| {
+        std::fs::create_dir_all(map_dir())?;
+        std::fs::write(format!("{}/current.{ext}", map_dir()), &buf)?;
+        map["image"] = json!(format!("current.{ext}"));
+        map["v"] = json!(map["v"].as_u64().unwrap_or(0) + 1); // cache-buster for the <img>
+        Ok(())
+    });
+    respond_json(request, result_json(result, "map updated"));
+}
+
+fn dm_map_token(mut request: tiny_http::Request, state: &Arc<Mutex<State>>) {
+    let req = read_body(&mut request);
+    let result = mutate_map(state, |map| {
+        let tokens = map["tokens"].as_array_mut().ok_or("bad map state")?;
+        match req["op"].as_str().unwrap_or("") {
+            "add" => {
+                let label = req["label"].as_str().unwrap_or("").trim().chars().take(40).collect::<String>();
+                if label.is_empty() {
+                    return Err("token needs a label".into());
+                }
+                let base_id = crate::campaign::slugify(&label);
+                let mut id = base_id.clone();
+                let mut n = 1;
+                while tokens.iter().any(|t| t["id"] == id.as_str()) {
+                    n += 1;
+                    id = format!("{base_id}-{n}");
+                }
+                let owner = req["owner"].as_str().unwrap_or("");
+                tokens.push(json!({
+                    "id": id, "label": label, "owner": owner,
+                    "x": frac(&req["x"], 0.5), "y": frac(&req["y"], 0.5),
+                }));
+            }
+            "move" => {
+                let t = tokens
+                    .iter_mut()
+                    .find(|t| t["id"] == req["id"])
+                    .ok_or("no such token")?;
+                t["x"] = json!(frac(&req["x"], 0.5));
+                t["y"] = json!(frac(&req["y"], 0.5));
+            }
+            "remove" => tokens.retain(|t| t["id"] != req["id"]),
+            _ => return Err("unknown map op".into()),
+        }
+        Ok(())
+    });
+    respond_json(request, result_json(result, "ok"));
+}
+
+/// Players may move exactly their own token — ownership checked server-side.
+fn player_map_token(mut request: tiny_http::Request, p: &PInfo, state: &Arc<Mutex<State>>) {
+    let req = read_body(&mut request);
+    let slug = p.slug.clone();
+    let result = mutate_map(state, |map| {
+        let tokens = map["tokens"].as_array_mut().ok_or("bad map state")?;
+        let t = tokens
+            .iter_mut()
+            .find(|t| t["id"] == req["id"] && t["owner"] == slug.as_str())
+            .ok_or("that token isn't yours")?;
+        t["x"] = json!(frac(&req["x"], 0.5));
+        t["y"] = json!(frac(&req["y"], 0.5));
+        Ok(())
+    });
+    respond_json(request, result_json(result, "ok"));
+}
+
+fn frac(v: &Value, default: f64) -> f64 {
+    v.as_f64().unwrap_or(default).clamp(0.0, 1.0)
+}
+
+fn result_json(result: Result<()>, ok_msg: &str) -> Value {
+    match result {
+        Ok(()) => json!({ "ok": true, "msg": ok_msg }),
+        Err(e) => json!({ "ok": false, "msg": e.to_string() }),
+    }
+}
+
+// ---------- direct-to-DM messages ----------
+
+fn msgs_path() -> String {
+    format!(".magehand/messages-{}.jsonl", crate::campaign::today())
+}
+
+/// Session-scoped whisper ledger, not canon — same tier as the cards JSONL.
+fn append_msg(from: &str, to: &str, text: &str) -> Result<()> {
+    std::fs::create_dir_all(".magehand")?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(msgs_path())?;
+    let line = json!({ "ts": crate::listen::now_hms(), "from": from, "to": to, "text": text });
+    f.write_all(format!("{line}\n").as_bytes())?;
+    Ok(())
+}
+
+fn msgs_for(slug: &str) -> Vec<Value> {
+    read_lossy(Path::new(&msgs_path()))
+        .map(|t| {
+            t.lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter(|m| m["from"] == slug || m["to"] == slug)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Player → DM whisper: lands as a card in the DM feed (reply is a card action).
+fn player_msg(mut request: tiny_http::Request, p: &PInfo, state: &Arc<Mutex<State>>) {
+    let req = read_body(&mut request);
+    let text: String = req["text"].as_str().unwrap_or("").trim().chars().take(500).collect();
+    if text.is_empty() {
+        respond_json(request, json!({ "ok": false, "msg": "empty message" }));
+        return;
+    }
+    if let Err(e) = append_msg(&p.slug, "dm", &text) {
+        respond_json(request, json!({ "ok": false, "msg": e.to_string() }));
+        return;
+    }
+    let mut st = state.lock().unwrap();
+    let id = st.next_id;
+    st.next_id += 1;
+    st.log.push(Ev::Card {
+        id,
+        card: json!({
+            "signal": "whisper",
+            "ts": crate::listen::now_hms(),
+            "headline": format!("{} whispers", p.name),
+            "body": text,
+            "ref": p.slug,
+            "live": true,
+        }),
+    });
+    drop(st);
+    respond_json(request, json!({ "ok": true }));
+}
+
+/// One SSE stream per player: DM replies now; map and RTC events later. Polls
+/// faster than the DM stream — this channel will carry WebRTC signaling, where
+/// 700 ms hops make call setup feel broken.
+fn stream_player(request: tiny_http::Request, state: &Arc<Mutex<State>>, slug: &str) {
+    let mut w = request.into_writer();
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Cache-Control: no-cache\r\n\
+                Connection: keep-alive\r\n\
+                X-Accel-Buffering: no\r\n\r\n";
+    if w.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let mut cursor = 0usize;
+    let mut sent_map = String::new();
+    let mut last_beat = Instant::now();
+    loop {
+        let frames = {
+            let st = state.lock().unwrap();
+            let mut out = String::new();
+            if let Some(log) = st.plogs.get(slug) {
+                for (event, data) in &log[cursor.min(log.len())..] {
+                    out.push_str(&sse(event, &data.to_string()));
+                }
+                cursor = log.len();
+            }
+            if st.map_json != sent_map && !st.map_json.is_empty() {
+                sent_map = st.map_json.clone();
+                out.push_str(&sse("map", &sent_map));
+            }
+            out
+        };
+        if !frames.is_empty() && w.write_all(frames.as_bytes()).is_err() {
+            return;
+        }
+        if last_beat.elapsed() > Duration::from_secs(15) {
+            last_beat = Instant::now();
+            if w.write_all(b": beat\n\n").is_err() {
+                return;
+            }
+        }
+        if w.flush().is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
 /// DM-shown page: one QR per player linking to their capability URL.
 fn join_page(players: &Players, base: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let mut cards = String::new();
-    let mut sorted: Vec<&PInfo> = players.by_token.values().collect();
+    let map = players.by_token.lock().unwrap();
+    let mut sorted: Vec<&PInfo> = map.values().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
     for p in sorted {
         let url = format!("{base}/p/{}", p.token);
@@ -299,6 +865,32 @@ struct State {
     acted: HashSet<u64>,  // card ids already actioned — makes taps idempotent
     threads_json: String,
     transcript: String,
+    party_json: String,
+    /// Per-player push feeds (slug → (event, data) log): DM replies now; map
+    /// updates and RTC signaling ride the same stream later. Session-bounded.
+    plogs: HashMap<String, Vec<(String, Value)>>,
+    /// Current map state as JSON — mirrors maps/state.json, diff-pushed to
+    /// every stream (DM and players) whenever a mutation lands.
+    map_json: String,
+    /// WebRTC signaling addressed to the DM (players' feeds ride plogs).
+    dm_rtc: Vec<Value>,
+    /// The live transcription session, when one is running.
+    live: Option<Live>,
+}
+
+/// A running online session: browsers POST silence-gated WAV utterances, one
+/// worker transcribes them in arrival order (ordering beats parallelism for a
+/// transcript; ponytail: more workers per campaign if a backlog ever shows),
+/// and the existing cards engine consumes the labeled lines unchanged.
+struct Live {
+    jobs: std::sync::mpsc::SyncSender<Job>,
+    live_path: String,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+struct Job {
+    speaker: String,
+    wav: Vec<u8>,
 }
 
 enum Ev {
@@ -336,9 +928,10 @@ fn spawn_poller(state: Arc<Mutex<State>>) {
                 }
             }
         }
-        // threads snapshot + transcript tail (cheap file reads; replace on change)
+        // threads/party snapshots + transcript tail (cheap file reads; replace on change)
         let threads = read_threads();
         let transcript = read_transcript();
+        let party = read_party();
         {
             let mut st = state.lock().unwrap();
             if threads != st.threads_json {
@@ -346,6 +939,9 @@ fn spawn_poller(state: Arc<Mutex<State>>) {
             }
             if transcript != st.transcript {
                 st.transcript = transcript;
+            }
+            if party != st.party_json {
+                st.party_json = party;
             }
         }
         std::thread::sleep(POLL);
@@ -365,8 +961,12 @@ fn stream_events(request: tiny_http::Request, state: Arc<Mutex<State>>) {
         return;
     }
     let mut cursor = 0usize;
+    let mut rtc_cursor = 0usize;
+    let mut sent_live: Option<bool> = None;
     let mut sent_threads = String::new();
     let mut sent_transcript = String::new();
+    let mut sent_party = String::new();
+    let mut sent_map = String::new();
     let mut last_beat = Instant::now();
     loop {
         let (frames, beat) = {
@@ -383,9 +983,26 @@ fn stream_events(request: tiny_http::Request, state: Arc<Mutex<State>>) {
                 }
             }
             cursor = st.log.len();
+            for msg in &st.dm_rtc[rtc_cursor.min(st.dm_rtc.len())..] {
+                out.push_str(&sse("rtc", &msg.to_string()));
+            }
+            rtc_cursor = st.dm_rtc.len();
+            let live_now = st.live.is_some();
+            if sent_live != Some(live_now) {
+                sent_live = Some(live_now);
+                out.push_str(&sse("session", &json!({ "live": live_now }).to_string()));
+            }
             if st.threads_json != sent_threads && !st.threads_json.is_empty() {
                 sent_threads = st.threads_json.clone();
                 out.push_str(&sse("threads", &sent_threads));
+            }
+            if st.party_json != sent_party && !st.party_json.is_empty() {
+                sent_party = st.party_json.clone();
+                out.push_str(&sse("party", &sent_party));
+            }
+            if st.map_json != sent_map && !st.map_json.is_empty() {
+                sent_map = st.map_json.clone();
+                out.push_str(&sse("map", &sent_map));
             }
             if st.transcript != sent_transcript {
                 sent_transcript = st.transcript.clone();
@@ -449,6 +1066,19 @@ fn handle_action(mut request: tiny_http::Request, state: Arc<Mutex<State>>) {
     let headline = card["headline"].as_str().unwrap_or("").trim();
     let result: Result<String> = match action.as_str() {
         "dismiss" => Ok("dismissed".into()),
+        "reply" => {
+            let text: String = req["text"].as_str().unwrap_or("").trim().chars().take(500).collect();
+            let to = card["ref"].as_str().unwrap_or("").to_string();
+            if text.is_empty() || to.is_empty() {
+                Err("need reply text".into())
+            } else {
+                append_msg("dm", &to, &text).map(|()| {
+                    let ev = json!({ "ts": crate::listen::now_hms(), "text": text });
+                    state.lock().unwrap().plogs.entry(to).or_default().push(("dm".into(), ev));
+                    "sent".into()
+                })
+            }
+        }
         "ruling" => {
             let body = card["body"].as_str().unwrap_or("");
             let text = if body.is_empty() { headline.to_string() } else { format!("{headline} — {body}") };
@@ -491,6 +1121,189 @@ fn respond_json(request: tiny_http::Request, payload: Value) {
     let _ = request.respond(Response::from_string(payload.to_string()).with_header(json_hdr()));
 }
 
+// ---------- voice / transcription ----------
+
+fn rtc_config() -> Value {
+    let mut servers = vec![json!({ "urls": "stun:stun.l.google.com:19302" })];
+    if let Ok(url) = std::env::var("MAGEHAND_TURN_URL") {
+        servers.push(json!({
+            "urls": url,
+            "username": std::env::var("MAGEHAND_TURN_USER").unwrap_or_default(),
+            "credential": std::env::var("MAGEHAND_TURN_PASS").unwrap_or_default(),
+        }));
+    }
+    json!({ "iceServers": servers })
+}
+
+/// Relay WebRTC signaling. `from` is stamped server-side from the caller's
+/// cookie, so a client can never speak as someone else.
+fn rtc_relay(
+    mut request: tiny_http::Request,
+    from: &str,
+    players: &Arc<Players>,
+    state: &Arc<Mutex<State>>,
+) {
+    let req = read_body(&mut request);
+    let Some(to) = req["to"].as_str().map(str::to_string) else {
+        respond_json(request, json!({ "ok": false, "msg": "need to" }));
+        return;
+    };
+    let msg = json!({ "from": from, "type": req["type"], "payload": req["payload"] });
+    // roster snapshot BEFORE the State lock — the two locks must never nest
+    let slugs: Vec<String> =
+        { players.by_token.lock().unwrap().values().map(|p| p.slug.clone()).collect() };
+    let mut st = state.lock().unwrap();
+    match to.as_str() {
+        "*" => {
+            for slug in slugs {
+                if slug != from {
+                    st.plogs.entry(slug).or_default().push(("rtc".into(), msg.clone()));
+                }
+            }
+            if from != "dm" {
+                st.dm_rtc.push(msg);
+            }
+        }
+        "dm" => st.dm_rtc.push(msg),
+        other => st.plogs.entry(other.to_string()).or_default().push(("rtc".into(), msg)),
+    }
+    drop(st);
+    respond_json(request, json!({ "ok": true }));
+}
+
+fn post_audio(mut request: tiny_http::Request, speaker: String, state: &Arc<Mutex<State>>) {
+    let len = request.body_length().unwrap_or(0);
+    if len == 0 || len > MAX_WAV {
+        respond_json(request, json!({ "ok": false, "msg": "utterance must be under 2 MB" }));
+        return;
+    }
+    let mut wav = Vec::with_capacity(len);
+    if request.as_reader().take(MAX_WAV as u64).read_to_end(&mut wav).is_err() {
+        respond_json(request, json!({ "ok": false, "msg": "upload failed" }));
+        return;
+    }
+    let sent = {
+        let st = state.lock().unwrap();
+        match &st.live {
+            None => Err("no session running"),
+            // full queue → drop this utterance rather than block the request
+            // thread; the browser keeps talking and later clips still land
+            Some(live) => live.jobs.try_send(Job { speaker, wav }).map_err(|_| "transcriber busy"),
+        }
+    };
+    match sent {
+        Ok(()) => respond_json(request, json!({ "ok": true })),
+        Err(msg) => respond_json(request, json!({ "ok": false, "msg": msg })),
+    }
+}
+
+fn session_ctl(mut request: tiny_http::Request, state: &Arc<Mutex<State>>) {
+    let req = read_body(&mut request);
+    let result = match req["op"].as_str().unwrap_or("") {
+        "start" => session_start(state),
+        "end" => session_end(state),
+        _ => Err("op must be start or end".into()),
+    };
+    match result {
+        Ok(msg) => respond_json(request, json!({ "ok": true, "msg": msg })),
+        Err(e) => respond_json(request, json!({ "ok": false, "msg": e.to_string() })),
+    }
+}
+
+fn session_start(state: &Arc<Mutex<State>>) -> Result<String> {
+    if state.lock().unwrap().live.is_some() {
+        return Err("a session is already running".into());
+    }
+    let lexicon = crate::listen::build_lexicon();
+    let hotwords = crate::listen::hotword_names(&lexicon);
+    let live_path = format!("{CAMPAIGN}/sessions/{}-live.md", crate::campaign::today());
+    // two racing starts both pass the check above; open_live's flock rejects
+    // the second one here, so at most one session ever owns the transcript
+    let mut live_file = crate::listen::open_live(&live_path)?;
+    let listener = crate::signals::Listener::new(false)?;
+    let (line_tx, line_rx) = std::sync::mpsc::sync_channel::<String>(64);
+    let listener_handle = std::thread::spawn(move || {
+        let mut listener = listener;
+        for line in line_rx {
+            listener.push_line(&line);
+        }
+        listener.finish(false);
+    });
+    let (jobs, job_rx) = std::sync::mpsc::sync_channel::<Job>(32);
+    let url = std::env::var("MAGEHAND_STT_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:9090/inference".into());
+    // one worker: transcript order beats parallelism
+    let worker = std::thread::spawn(move || {
+        for job in job_rx {
+            let text = match transcribe(&url, &job.wav, &hotwords) {
+                Ok(t) => crate::listen::clean_stt_line(&t),
+                Err(e) => {
+                    eprintln!("serve: transcription failed: {e}");
+                    continue;
+                }
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let line = format!("{}: {text}", job.speaker);
+            if let Err(e) = crate::listen::append_line(&mut live_file, &line) {
+                eprintln!("serve: couldn't write transcript: {e}");
+            }
+            let _ = line_tx.try_send(line); // analysis may lag; the transcript is complete
+        }
+        // live_file drops here, releasing the flock before finalize renames it
+    });
+    state.lock().unwrap().live =
+        Some(Live { jobs, live_path, handles: vec![worker, listener_handle] });
+    Ok("session started".into())
+}
+
+fn session_end(state: &Arc<Mutex<State>>) -> Result<String> {
+    let live = state.lock().unwrap().live.take().ok_or("no session running")?;
+    let Live { jobs, live_path, handles } = live;
+    drop(jobs); // worker drains the queue and exits; its line sender then ends the listener
+    for h in handles {
+        h.join().map_err(|_| "session thread panicked")?;
+    }
+    crate::listen::finalize(&live_path, &crate::listen::build_lexicon(), true)?;
+    Ok("session ended".into())
+}
+
+/// Hand-built multipart POST to whisper-server's /inference — one static
+/// boundary is fine because WAV bytes can't contain it and the text parts are
+/// our own.
+fn transcribe(url: &str, wav: &[u8], prompt: &str) -> Result<String> {
+    const B: &str = "----magehand7f3a9c1e";
+    let mut body = Vec::with_capacity(wav.len() + 512);
+    body.extend_from_slice(
+        format!(
+            "--{B}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"u.wav\"\r\n\
+             Content-Type: audio/wav\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(wav);
+    for (name, value) in [("response_format", "json"), ("prompt", prompt)] {
+        body.extend_from_slice(
+            format!("\r\n--{B}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}")
+                .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("\r\n--{B}--\r\n").as_bytes());
+    let resp = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .post(url)
+        .set("Content-Type", &format!("multipart/form-data; boundary={B}"))
+        .send_bytes(&body)
+        .map_err(|e| format!("whisper-server: {e}"))?;
+    let v: Value = resp.into_json()?;
+    v["text"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("unexpected STT response: {v}").into())
+}
+
 // ---------- vault reads ----------
 
 fn read_threads() -> String {
@@ -512,6 +1325,27 @@ fn read_threads() -> String {
         b["overdue"].as_bool().cmp(&a["overdue"].as_bool())
             .then(a["title"].as_str().cmp(&b["title"].as_str()))
     });
+    Value::Array(out).to_string()
+}
+
+/// The glanceable numbers a DM checks mid-combat, one object per PC.
+fn read_party() -> String {
+    const KEYS: &[&str] = &[
+        "class", "level", "cur_hp", "max_hp", "temp_hp", "ac", "passive_perception",
+        "conditions", "death_success", "death_fail", "inspiration",
+    ];
+    let mut out = Vec::new();
+    for slug in sheets::roster() {
+        let Some((fm, _)) = sheets::read_sheet(&slug) else { continue };
+        let mut o = serde_json::Map::new();
+        o.insert("name".into(), json!(sheets::display_name(&slug)));
+        for (k, v) in fm {
+            if KEYS.contains(&k.as_str()) {
+                o.insert(k, json!(v));
+            }
+        }
+        out.push(Value::Object(o));
+    }
     Value::Array(out).to_string()
 }
 
@@ -601,7 +1435,20 @@ fn json_hdr() -> Header {
     header("Content-Type", "application/json")
 }
 
-fn cookie_hdr(name: &str, token: &str) -> Header {
-    // session cookie, host-only; SameSite=Lax so the token in the URL sets it on first load
-    header("Set-Cookie", &format!("{name}={token}; Path=/; SameSite=Lax"))
+/// tiny_http sends no cache headers at all, and Chrome will happily reuse a
+/// header-less page across server restarts — token-gated pages must never come
+/// from disk cache.
+fn nostore_hdr() -> Header {
+    header("Cache-Control", "no-store")
+}
+
+fn cookie_hdr(name: &str, token: &str, base: &Base) -> Header {
+    // Path-scoped so two campaigns behind one domain can't clobber each other's
+    // cookies; HttpOnly keeps page JS away from the capability token; Secure
+    // only when the public base is https (plain-LAN serve still works).
+    let secure = if base.secure { "; Secure" } else { "" };
+    header(
+        "Set-Cookie",
+        &format!("{name}={token}; Path={}/; SameSite=Lax; HttpOnly{secure}", base.path),
+    )
 }
