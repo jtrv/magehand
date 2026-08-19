@@ -259,3 +259,24 @@ observable at an actual table. Total: roughly doubles the current codebase,
 3. **Table is phones-flexible** — Phase 4 player pages are viable as designed.
 4. Still open: **wake phrase** — test "hey magehand" transcription reliability
    during Phase 1 shadow sessions.
+
+## Online mode addendum (2026-08)
+
+Online play (README → "Online play") deliberately flips refusals that were
+premised on the physical single-mic table. The premises don't survive remote
+play; the reasoning does:
+
+- **Per-player mics** — the setup-friction argument doesn't apply to remote
+  players: each already sits at a device with a mic. Every browser captures
+  its own stream.
+- **Speaker attribution** — per-stream labels, not diarization. One stream per
+  player means "who said what" is known by construction; the 20-35%
+  diarization-error objection is void because no diarization runs.
+- **VTT-lite map** — remote tables have no physical battle mat, so a shared
+  map fills that gap. Fog of war, dice engine, and combat automation stay
+  refused.
+- **Player-to-player chat stays absent** — only player↔DM whispers exist.
+
+"Audio never leaves the laptop" holds for in-person mode only. Online mode's
+promise is transcribe-then-delete: player audio reaches the host, is
+transcribed, and is discarded — only text persists.

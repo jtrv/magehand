@@ -13,3 +13,5 @@ token.txt
 .claude/
 CLAUDE.md
 AGENTS.md
+.playwright-mcp/
+/*.png

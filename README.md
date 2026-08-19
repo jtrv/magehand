@@ -4,6 +4,13 @@ Tabletop RPG assistant for DMs: local RAG over your rulebooks **and your campaig
 answered by an LLM (OpenRouter or a local Ollama model). Campaign state lives as a
 plain-markdown Obsidian vault that magehand both writes and reads.
 
+![magehand ask: a rules question answered in numbered cases, with a Reasoning & Section References block citing the exact rulebook file and section each point came from](docs/magehand-ask.webp)
+
+![magehand search: scored retrieval hits, each showing relevance score, RULEBOOK tag, source file, section, and matching excerpt](docs/magehand-search.webp)
+
+`ask` cites its answer down to the file and section so you can check it; `search`
+shows the raw scored retrieval behind an answer, no model call involved.
+
 ## Quickstart
 
 ```sh
@@ -160,6 +167,53 @@ transcript looks rough.
 
 Write-back commands re-index automatically; answers get labeled excerpts with
 precedence **house rules > campaign canon > rulebooks**, and conflicts are flagged.
+
+## Online play
+
+The same table, remote. Players join in the browser: each gets a link
+(capability URL) and picks a PIN on first open — that's the whole login. The
+page carries voice chat (WebRTC mesh, in-page — no Discord), the shared map,
+their live sheet, and whisper-to-DM. Each player's mic is captured as its own
+stream and transcribed server-side, so the transcript is speaker-labeled by
+construction — one stream per player, no diarization. The DM page adds a party
+strip. Ending the session runs the same cleanup → draft → `magehand log`
+promotion as in-person mode.
+
+One table:
+
+```sh
+magehand serve --public-base https://your.domain   # behind any TLS proxy
+```
+
+Several campaigns on one box:
+
+```sh
+magehand host new curse-of-strahd --data-dir /srv/dnd   # create a campaign
+magehand host --data-dir /srv/dnd --public-url https://your.domain
+```
+
+`host` runs one `serve` process per campaign subdir and writes
+`Caddyfile.magehand` next to them for the reverse proxy.
+
+**Transcription** needs whisper.cpp's server running:
+
+```sh
+whisper-server -m models/ggml-large-v3-turbo.bin --port 9090
+```
+
+`MAGEHAND_STT_URL` points at it (default `http://127.0.0.1:9090/inference`).
+
+**Voice reachability:** STUN-only by default; roughly 1 in 6 NAT pairs won't
+connect without a relay. Run coturn on the same box and set
+`MAGEHAND_TURN_URL` / `MAGEHAND_TURN_USER` / `MAGEHAND_TURN_PASS`.
+
+**Consent, online:** voice *is* sent to the host for transcription. Uploaded
+audio is transcribed and discarded — it never touches disk; only the text
+transcript persists. Players sitting in the same room should share one device
+or wear headphones (echo).
+
+A leaked player link can be regenerated from the DM dashboard (`POST /regen`);
+the old URL stops working.
 
 ## The vault (Obsidian)
 
