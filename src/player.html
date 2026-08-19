@@ -21,6 +21,7 @@
     color:var(--dim); font:inherit; font-size:13px; padding:7px 13px; }
   #voicebar button:disabled { opacity:.5; }
   #voicebar button.on { color:var(--ink); border-color:var(--accent); background:#2f3b52; }
+  #voicebar button.ooc { color:#e0603a; border-color:#e0603a; background:#54302a; }
   #voicecount { color:var(--dim); font-size:13px; }
   .hidden { display:none; }
   /* sheet */
@@ -92,6 +93,7 @@
   <div id="voicebar">
     <button id="voicejoin" disabled>Join voice</button>
     <button id="voicemute" class="hidden">Mute</button>
+    <button id="voiceooc" class="hidden">OOC</button>
     <span id="voicecount"></span>
   </div>
   <main>
@@ -362,8 +364,8 @@ ev.addEventListener('dm', e=>{
 ev.addEventListener('map', e=>renderMap(JSON.parse(e.data)));
 
 // voice
-const vjoin = $('#voicejoin'), vmute = $('#voicemute'), vcount = $('#voicecount');
-let vjoined = false, vmuted = false;
+const vjoin = $('#voicejoin'), vmute = $('#voicemute'), vooc = $('#voiceooc'), vcount = $('#voicecount');
+let vjoined = false, vmuted = false, vooced = false;
 function voicePeers(list){
   vcount.textContent = vjoined ? (list.length+1)+' in voice' : '';
 }
@@ -375,14 +377,17 @@ vjoin.onclick = async ()=>{
       vjoined = true;
       vjoin.textContent = 'Leave'; vjoin.classList.add('on');
       vmute.classList.remove('hidden');
+      vooc.classList.remove('hidden');
       voicePeers([]);
     }catch(e){ toast('mic unavailable'); }
     vjoin.disabled = false;
   }else{
     Voice.leave();
-    vjoined = false; vmuted = false;
+    vjoined = false; vmuted = false; vooced = false;
     vjoin.textContent = 'Join voice'; vjoin.classList.remove('on');
     vmute.textContent = 'Mute'; vmute.classList.remove('on'); vmute.classList.add('hidden');
+    vooc.classList.remove('ooc'); vooc.classList.add('hidden');
+    Voice.setOoc(false);
     vcount.textContent = '';
   }
 };
@@ -391,6 +396,11 @@ vmute.onclick = ()=>{
   Voice.selfMute(vmuted);
   vmute.textContent = vmuted ? 'Unmute' : 'Mute';
   vmute.classList.toggle('on', vmuted);
+};
+vooc.onclick = ()=>{
+  vooced = !vooced;
+  Voice.setOoc(vooced);
+  vooc.classList.toggle('ooc', vooced);
 };
 
 load();

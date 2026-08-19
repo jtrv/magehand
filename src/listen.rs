@@ -185,14 +185,30 @@ pub(crate) fn finalize(live_path: &str, lexicon: &[Entity], labeled: bool) -> Re
         body.to_string()
     };
     let names = hotword_names(lexicon);
-    // roster-primed attribution — the transcript has no speaker labels, so the
-    // model resolves "who acted" from the words plus the known cast
+    // roster-primed attribution — knowing the cast (and their classes) resolves
+    // "who acted" offline and NPC-vs-PC attribution online
     let roster = crate::sheets::player_roster();
     let who = if labeled {
         // online mode: every line already carries its speaker (one mic per player)
-        "Each line is prefixed with the speaker's name — trust these labels when \
-         attributing actions. "
-            .to_string()
+        let cast = if roster.is_empty() {
+            String::new()
+        } else {
+            format!("The player characters are: {roster}. ")
+        };
+        format!(
+            "Each line is prefixed with the speaker's name — trust these labels for who is \
+             talking. {cast}A (ooc) marker after a name is that speaker's own out-of-character \
+             flag: treat it as a strong hint the line is table talk, but judge by content — \
+             people forget to toggle in both directions, so an (ooc)-marked line that is \
+             clearly in-game play still counts, and an unmarked line that is clearly table \
+             chatter is still chatter. Classify each utterance and render accordingly: \
+             in-character dialogue becomes a quoted script line (Speaker: \"…\"); when the \
+             DM's line is clearly spoken as a named NPC, attribute the quote to that NPC \
+             (correct proper nouns are listed above) instead of \"DM\"; a character's \
+             described action stays a terse bullet; dice/mechanics talk is kept only when \
+             it changes an outcome (a ruling, a failed save that matters); out-of-character \
+             chatter is dropped entirely. "
+        )
     } else if roster.is_empty() {
         String::new()
     } else {

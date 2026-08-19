@@ -992,6 +992,7 @@ struct Live {
 struct Job {
     speaker: String,
     wav: Vec<u8>,
+    ooc: bool,
 }
 
 enum Ev {
@@ -1296,6 +1297,11 @@ fn rtc_relay(
 }
 
 fn post_audio(mut request: tiny_http::Request, speaker: String, state: &Arc<Mutex<State>>) {
+    // advisory out-of-character flag set by the browser's OOC toggle
+    let ooc = request
+        .headers()
+        .iter()
+        .any(|h| h.field.equiv("X-OOC") && h.value.as_str() == "1");
     let len = request.body_length().unwrap_or(0);
     if len == 0 || len > MAX_WAV {
         respond_json(request, json!({ "ok": false, "msg": "utterance must be under 2 MB" }));
@@ -1312,7 +1318,9 @@ fn post_audio(mut request: tiny_http::Request, speaker: String, state: &Arc<Mute
             None => Err("no session running"),
             // full queue → drop this utterance rather than block the request
             // thread; the browser keeps talking and later clips still land
-            Some(live) => live.jobs.try_send(Job { speaker, wav }).map_err(|_| "transcriber busy"),
+            Some(live) => {
+                live.jobs.try_send(Job { speaker, wav, ooc }).map_err(|_| "transcriber busy")
+            }
         }
     };
     match sent {
@@ -1396,7 +1404,8 @@ fn session_start(state: &Arc<Mutex<State>>) -> Result<String> {
             if text.is_empty() {
                 continue;
             }
-            let line = format!("{}: {text}", job.speaker);
+            let marker = if job.ooc { " (ooc)" } else { "" };
+            let line = format!("{}{marker}: {text}", job.speaker);
             if let Err(e) = crate::listen::append_line(&mut live_file, &line) {
                 eprintln!("serve: couldn't write transcript: {e}");
             }

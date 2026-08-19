@@ -5,7 +5,7 @@
 const RMS_GATE = 0.012, HANG_MS = 700, MIN_MS = 400, MAX_MS = 15000;
 
 let me = null, es = null, onPeers = null, cfg = { iceServers: [] };
-let stream = null, ctx = null, node = null, joined = false;
+let stream = null, ctx = null, node = null, joined = false, ooc = false;
 const peers = new Map();   // peer id -> RTCPeerConnection
 const muted = new Set();   // peer ids we locally muted
 const pendingIce = new Map(); // peer id -> candidates queued before the remote description landed
@@ -135,7 +135,9 @@ function shipWav(bufs, frames, rate){
     const s = Math.max(-1, Math.min(1, all[Math.floor(i*step)]));
     dv.setInt16(44+i*2, s<0 ? s*0x8000 : s*0x7fff, true);
   }
-  fetch('audio', {method:'POST', headers:{'Content-Type':'audio/wav'}, body:wav}).catch(()=>{});
+  const headers = {'Content-Type':'audio/wav'};
+  if(ooc) headers['X-OOC'] = '1';
+  fetch('audio', {method:'POST', headers, body:wav}).catch(()=>{});
 }
 
 async function startCapture(){
@@ -207,6 +209,8 @@ window.Voice = {
   },
   // disabled track produces silence, so the RMS gate closes too — no WAVs ship
   selfMute(on){ if(stream) stream.getAudioTracks().forEach(t=>{ t.enabled = !on; }); },
+  // advisory: marks uploaded utterances as out-of-character (X-OOC header)
+  setOoc(on){ ooc = !!on; },
   mute(id, on){
     if(on) muted.add(id); else muted.delete(id);
     const a = document.getElementById('aud-'+id);

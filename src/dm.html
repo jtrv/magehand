@@ -42,6 +42,7 @@
     border-radius:999px; padding:4px 11px; font-size:14px; color:var(--dim); min-height:0; }
   #pins .vbtn.on { color:var(--whisper); border-color:var(--whisper); }
   #pins .vbtn.muted { color:var(--trigger); border-color:var(--trigger); }
+  #pins .vbtn.ooc { color:var(--trigger); border-color:var(--trigger); }
   #voicepeers { display:contents; }
   #mapview { flex:1; overflow:auto; padding:12px; }
   #mapctl { display:flex; gap:8px; margin-bottom:10px; align-items:center; flex-wrap:wrap; }
@@ -99,6 +100,7 @@
     <button id="maptoggle">Map</button>
     <button id="voicejoin" class="vbtn">Join voice</button>
     <button id="voicemute" class="vbtn hidden">Mute</button>
+    <button id="voiceooc" class="vbtn hidden">OOC</button>
     <span id="voicepeers"></span>
     <button id="sessbtn" class="vbtn">Start session</button></div>
   <div id="mapview" class="hidden">
@@ -274,9 +276,10 @@ setInterval(()=>{
 // ---- voice + session ----
 const vjoin  = document.getElementById('voicejoin');
 const vmute  = document.getElementById('voicemute');
+const vooc   = document.getElementById('voiceooc');
 const vpeers = document.getElementById('voicepeers');
 const sess   = document.getElementById('sessbtn');
-let vjoined = false, vmuted = false;
+let vjoined = false, vmuted = false, vooced = false;
 
 function renderPeers(list){
   vpeers.innerHTML = '';
@@ -298,13 +301,16 @@ vjoin.onclick = async ()=>{
       vjoined = true;
       vjoin.textContent = 'Leave voice'; vjoin.classList.add('on');
       vmute.classList.remove('hidden');
+      vooc.classList.remove('hidden');
     }catch(e){ showToast('mic unavailable'); }
     vjoin.disabled = false;
   }else{
     Voice.leave();
-    vjoined = false; vmuted = false;
+    vjoined = false; vmuted = false; vooced = false;
     vjoin.textContent = 'Join voice'; vjoin.classList.remove('on');
     vmute.textContent = 'Mute'; vmute.classList.remove('on'); vmute.classList.add('hidden');
+    vooc.classList.remove('ooc'); vooc.classList.add('hidden');
+    Voice.setOoc(false);
     renderPeers([]);
   }
 };
@@ -313,6 +319,11 @@ vmute.onclick = ()=>{
   Voice.selfMute(vmuted);
   vmute.textContent = vmuted ? 'Unmute' : 'Mute';
   vmute.classList.toggle('on', vmuted);
+};
+vooc.onclick = ()=>{
+  vooced = !vooced;
+  Voice.setOoc(vooced);
+  vooc.classList.toggle('ooc', vooced);
 };
 
 let sessLive = false;
