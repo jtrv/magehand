@@ -5,9 +5,10 @@
 const RMS_GATE = 0.012, HANG_MS = 700, MIN_MS = 400, MAX_MS = 15000;
 
 let me = null, es = null, onPeers = null, cfg = { iceServers: [] };
-let stream = null, ctx = null, node = null;
+let stream = null, ctx = null, node = null, joined = false;
 const peers = new Map();   // peer id -> RTCPeerConnection
 const muted = new Set();   // peer ids we locally muted
+const pendingIce = new Map(); // peer id -> candidates queued before the remote description landed
 
 function post(type, to, payload){
   return fetch('rtc', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -32,6 +33,7 @@ function audioEl(id){
 function drop(id){
   const p = peers.get(id);
   if(p){ p.close(); peers.delete(id); }
+  pendingIce.delete(id);
   const a = document.getElementById('aud-'+id);
   if(a) a.remove();
   notify();
@@ -63,7 +65,13 @@ async function offerTo(id){
   post('offer', id, p.localDescription);
 }
 
+async function flushIce(id, p){
+  for(const c of pendingIce.get(id) || []) await p.addIceCandidate(c).catch(()=>{});
+  pendingIce.delete(id);
+}
+
 async function onRtc(e){
+  if(!joined) return;
   const m = JSON.parse(e.data);
   const {from, type, payload} = m;
   if(!from || from === me) return;
@@ -78,12 +86,23 @@ async function onRtc(e){
         await p.setLocalDescription({type:'rollback'});
       }
       await p.setRemoteDescription(payload);
+      await flushIce(from, p);
       await p.setLocalDescription(await p.createAnswer());
       post('answer', from, p.localDescription);
     }else if(type === 'answer'){
-      if(p.signalingState === 'have-local-offer') await p.setRemoteDescription(payload);
+      if(p.signalingState === 'have-local-offer'){
+        await p.setRemoteDescription(payload);
+        await flushIce(from, p);
+      }
     }else if(type === 'ice'){
-      await p.addIceCandidate(payload).catch(()=>{});
+      // candidates can outrun the offer/answer over the relay — queue until
+      // the remote description is in place, then flush
+      if(p.remoteDescription){
+        await p.addIceCandidate(payload).catch(()=>{});
+      }else{
+        if(!pendingIce.has(from)) pendingIce.set(from, []);
+        pendingIce.get(from).push(payload);
+      }
     }
   }catch(err){ console.warn('rtc', type, err); }
 }
@@ -153,15 +172,27 @@ async function startCapture(){
 
 window.Voice = {
   async join(id, eventSource, peersCb){
-    if(me) return;
+    if(joined || me) return;  // already in (or mid-join) — don't re-acquire the mic
     me = id; es = eventSource; onPeers = peersCb;
-    cfg = await (await fetch('rtc-config')).json();
-    stream = await navigator.mediaDevices.getUserMedia(
-      {audio:{echoCancellation:true, noiseSuppression:true}});
-    es.addEventListener('rtc', onRtc);
-    await startCapture();
-    post('join', '*', null);
-    notify();
+    try{
+      cfg = await (await fetch('rtc-config')).json();
+      stream = await navigator.mediaDevices.getUserMedia(
+        {audio:{echoCancellation:true, noiseSuppression:true}});
+      es.addEventListener('rtc', onRtc);
+      await startCapture();
+      joined = true;
+      post('join', '*', null);
+      notify();
+    }catch(err){
+      // undo everything acquired so far so a retry starts clean
+      if(es) es.removeEventListener('rtc', onRtc);
+      if(node) node.port.onmessage = null;
+      if(ctx) ctx.close();
+      if(stream) stream.getTracks().forEach(t=>t.stop());
+      me = es = onPeers = stream = ctx = node = null;
+      joined = false;
+      throw err;
+    }
   },
   leave(){
     if(!me) return;
@@ -172,6 +203,7 @@ window.Voice = {
     if(ctx) ctx.close();
     if(stream) stream.getTracks().forEach(t=>t.stop());
     me = es = onPeers = stream = ctx = node = null;
+    joined = false;
   },
   // disabled track produces silence, so the RMS gate closes too — no WAVs ship
   selfMute(on){ if(stream) stream.getAudioTracks().forEach(t=>{ t.enabled = !on; }); },

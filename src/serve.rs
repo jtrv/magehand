@@ -21,6 +21,10 @@ const ASK_PER_DAY: usize = 150; // per campaign — hosted means the host pays t
 const MAX_IMAGE: usize = 8 * 1024 * 1024;
 const MAX_WAV: usize = 2 * 1024 * 1024; // ~60s of 16kHz PCM16 — one gated utterance
 const PIN_TRIES_PER_HOUR: usize = 5;
+const MSG_PER_HOUR: usize = 60;
+const RTC_BACKLOG: usize = 4096; // per-peer signaling queue cap — an absent reader must not grow memory forever
+const SSE_PER_PLAYER: usize = 4;
+const SSE_DM: usize = 8;
 const TOKENS_PATH: &str = ".magehand/tokens.json";
 
 /// Player roster + capability tokens (mutable: the DM can regenerate a leaked
@@ -32,6 +36,38 @@ struct Players {
     ask_log: Mutex<HashMap<String, Vec<Instant>>>,
     campaign_asks: Mutex<Vec<Instant>>,
     pin_log: Mutex<HashMap<String, Vec<Instant>>>,
+    msg_log: Mutex<HashMap<String, Vec<Instant>>>,
+}
+
+/// Live SSE stream counts, keyed by player slug ("\0dm" for the DM feed —
+/// NUL can't appear in a slug). A phone that reconnects without closing old
+/// streams must not pile up polling threads forever.
+static SSE_COUNTS: std::sync::LazyLock<Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// One reserved stream slot; Drop returns it, so every exit path of a stream
+/// thread (client gone, write error) releases the slot.
+struct SseSlot(String);
+
+impl SseSlot {
+    fn take(key: &str, cap: usize) -> Option<Self> {
+        let mut counts = SSE_COUNTS.lock().unwrap();
+        let n = counts.entry(key.to_string()).or_insert(0);
+        if *n >= cap {
+            return None;
+        }
+        *n += 1;
+        Some(Self(key.to_string()))
+    }
+}
+
+impl Drop for SseSlot {
+    fn drop(&mut self) {
+        let mut counts = SSE_COUNTS.lock().unwrap();
+        if let Some(n) = counts.get_mut(&self.0) {
+            *n = n.saturating_sub(1);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -124,10 +160,19 @@ pub(crate) fn cmd_serve(args: &[String]) -> Result<()> {
             (Method::Get, "/join") => {
                 let _ = request.respond(join_page(&players, &base.url).with_header(html_hdr()).with_header(nostore_hdr()));
             }
-            (Method::Get, "/events") => {
-                let st = Arc::clone(&state);
-                std::thread::spawn(move || stream_events(request, st));
-            }
+            (Method::Get, "/events") => match SseSlot::take("\0dm", SSE_DM) {
+                Some(slot) => {
+                    let st = Arc::clone(&state);
+                    std::thread::spawn(move || {
+                        let _slot = slot;
+                        stream_events(request, st);
+                    });
+                }
+                None => {
+                    let _ = request
+                        .respond(Response::from_string("too many streams").with_status_code(429));
+                }
+            },
             (Method::Post, "/action") => {
                 // off the accept loop: a slow/held-open body must not freeze the
                 // whole dashboard for every other client
@@ -230,6 +275,7 @@ fn build_players() -> Result<(Players, String)> {
         ask_log: Mutex::new(HashMap::new()),
         campaign_asks: Mutex::new(Vec::new()),
         pin_log: Mutex::new(HashMap::new()),
+        msg_log: Mutex::new(HashMap::new()),
     };
     Ok((players, dm_token))
 }
@@ -282,16 +328,26 @@ fn route_player(
             None => reject(request),
         },
         (Method::Get, "events") => match player_auth(&request, players) {
-            Some(p) => {
-                let st = Arc::clone(state);
-                std::thread::spawn(move || stream_player(request, &st, &p.slug));
-            }
+            Some(p) => match SseSlot::take(&p.slug, SSE_PER_PLAYER) {
+                Some(slot) => {
+                    let st = Arc::clone(state);
+                    std::thread::spawn(move || {
+                        let _slot = slot;
+                        stream_player(request, &st, &p.slug);
+                    });
+                }
+                None => {
+                    let _ = request
+                        .respond(Response::from_string("too many streams").with_status_code(429));
+                }
+            },
             None => reject(request),
         },
         (Method::Post, "msg") => match player_auth(&request, players) {
             Some(p) => {
                 let st = Arc::clone(state);
-                std::thread::spawn(move || player_msg(request, &p, &st));
+                let pl = Arc::clone(players);
+                std::thread::spawn(move || player_msg(request, &p, &pl, &st));
             }
             None => reject(request),
         },
@@ -336,10 +392,9 @@ fn route_player(
             None => reject(request),
         },
         (Method::Post, "claim") => player_claim(request, players, base),
-        // anything else under /p/ is a capability-token landing → PIN gate
-        (Method::Get, tok) => {
-            let tok = tok.split('?').next().unwrap_or(tok).to_string();
-            let known = { players.by_token.lock().unwrap().get(&tok).cloned() };
+        (Method::Get, "claim") => {
+            let known = cookie_of(&request, "mhc")
+                .and_then(|tok| players.by_token.lock().unwrap().get(&tok).cloned());
             match known {
                 Some(p) => {
                     let _ = request
@@ -348,6 +403,21 @@ fn route_player(
                 None => {
                     let _ = request.respond(Response::from_string("unknown player link").with_status_code(404));
                 }
+            }
+        }
+        // anything else under /p/ is a capability-token landing: stash the
+        // token in a claim cookie and bounce, so the capability URL leaves
+        // history/proxy logs before the PIN gate renders
+        (Method::Get, tok) => {
+            let tok = tok.split('?').next().unwrap_or(tok).to_string();
+            let known = players.by_token.lock().unwrap().contains_key(&tok);
+            if known {
+                let _ = request.respond(
+                    redirect(&format!("{}/p/claim", base.path))
+                        .with_header(cookie_hdr("mhc", &tok, base)),
+                );
+            } else {
+                let _ = request.respond(Response::from_string("unknown player link").with_status_code(404));
             }
         }
         _ => reject(request),
@@ -361,14 +431,18 @@ fn player_claim(mut request: tiny_http::Request, players: &Arc<Players>, base: &
     let mut body = String::new();
     let cap = request.body_length().unwrap_or(0).min(MAX_BODY);
     let _ = request.as_reader().take(cap as u64).read_to_string(&mut body);
-    let field = |k: &str| {
-        body.split('&').find_map(|kv| {
-            let (key, v) = kv.split_once('=')?;
-            (key == k).then(|| v.to_string())
-        })
-    };
-    let (Some(tok), Some(pin)) = (field("token"), field("pin")) else {
+    let pin = body.split('&').find_map(|kv| {
+        let (key, v) = kv.split_once('=')?;
+        (key == "pin").then(|| v.to_string())
+    });
+    let (Some(tok), Some(pin)) = (cookie_of(&request, "mhc"), pin) else {
         let _ = request.respond(Response::from_string("bad claim").with_status_code(400));
+        return;
+    };
+    // token lookup BEFORE the throttle: unknown tokens must not grow pin_log,
+    // or unauthenticated spam becomes unbounded memory
+    let Some(p) = players.by_token.lock().unwrap().get(&tok).cloned() else {
+        let _ = request.respond(Response::from_string("unknown player link").with_status_code(404));
         return;
     };
     {
@@ -383,27 +457,36 @@ fn player_claim(mut request: tiny_http::Request, players: &Arc<Players>, base: &
         }
         hits.push(now);
     }
-    let mut map = players.by_token.lock().unwrap();
-    let Some(p) = map.get(&tok).cloned() else {
-        let _ = request.respond(Response::from_string("unknown player link").with_status_code(404));
-        return;
-    };
     if !(4..=6).contains(&pin.len()) || !pin.chars().all(|c| c.is_ascii_digit()) {
         let page = claim_page(&p, "PIN must be 4–6 digits");
         let _ = request.respond(Response::from_string(page).with_header(html_hdr()).with_header(nostore_hdr()));
         return;
     }
     if p.pin.is_empty() {
-        map.get_mut(&tok).expect("lock held since fetch").pin = pin;
-        let _ = save_tokens(&players.dm_token, &map);
+        let mut map = players.by_token.lock().unwrap();
+        let Some(entry) = map.get_mut(&tok) else {
+            drop(map);
+            let _ = request.respond(Response::from_string("unknown player link").with_status_code(404));
+            return;
+        };
+        entry.pin = pin;
+        if let Err(e) = save_tokens(&players.dm_token, &map) {
+            // unpersisted PIN must not gate future claims — roll back and report
+            map.get_mut(&tok).expect("lock held since fetch").pin = String::new();
+            drop(map);
+            let page = claim_page(&p, &format!("couldn't save PIN ({e}) — try again"));
+            let _ = request.respond(Response::from_string(page).with_header(html_hdr()).with_header(nostore_hdr()));
+            return;
+        }
     } else if p.pin != pin {
         let page = claim_page(&p, "wrong PIN — try again");
         let _ = request.respond(Response::from_string(page).with_header(html_hdr()).with_header(nostore_hdr()));
         return;
     }
-    drop(map);
     let _ = request.respond(
-        redirect(&format!("{}/p/", base.path)).with_header(cookie_hdr("mhp", &tok, base)),
+        redirect(&format!("{}/p/", base.path))
+            .with_header(cookie_hdr("mhp", &tok, base))
+            .with_header(clear_cookie_hdr("mhc", base)),
     );
 }
 
@@ -427,10 +510,8 @@ fn claim_page(p: &PInfo, error: &str) -> String {
          <form method=post action=claim>\
          <h1>{} — {title}</h1><p>{hint}</p>{err}\
          <input name=pin inputmode=numeric pattern='[0-9]*' maxlength=6 autofocus autocomplete=off>\
-         <input type=hidden name=token value='{}'>\
          <button>Join</button></form>",
         html_escape(&p.name),
-        p.token,
     )
 }
 
@@ -732,12 +813,29 @@ fn msgs_for(slug: &str) -> Vec<Value> {
 }
 
 /// Player → DM whisper: lands as a card in the DM feed (reply is a card action).
-fn player_msg(mut request: tiny_http::Request, p: &PInfo, state: &Arc<Mutex<State>>) {
+fn player_msg(
+    mut request: tiny_http::Request,
+    p: &PInfo,
+    players: &Arc<Players>,
+    state: &Arc<Mutex<State>>,
+) {
     let req = read_body(&mut request);
     let text: String = req["text"].as_str().unwrap_or("").trim().chars().take(500).collect();
     if text.is_empty() {
         respond_json(request, json!({ "ok": false, "msg": "empty message" }));
         return;
+    }
+    {
+        let mut log = players.msg_log.lock().unwrap();
+        let now = Instant::now();
+        let hits = log.entry(p.slug.clone()).or_default();
+        hits.retain(|t| now.duration_since(*t) < Duration::from_secs(3600));
+        if hits.len() >= MSG_PER_HOUR {
+            drop(log);
+            respond_json(request, json!({ "ok": false, "msg": "slow down" }));
+            return;
+        }
+        hits.push(now);
     }
     if let Err(e) = append_msg(&p.slug, "dm", &text) {
         respond_json(request, json!({ "ok": false, "msg": e.to_string() }));
@@ -876,6 +974,9 @@ struct State {
     dm_rtc: Vec<Value>,
     /// The live transcription session, when one is running.
     live: Option<Live>,
+    /// True while `session end` finalizes with the lock released — a new start
+    /// must not reopen the live path before the old one is renamed away.
+    session_ending: bool,
 }
 
 /// A running online session: browsers POST silence-gated WAV utterances, one
@@ -1152,20 +1253,43 @@ fn rtc_relay(
     // roster snapshot BEFORE the State lock — the two locks must never nest
     let slugs: Vec<String> =
         { players.by_token.lock().unwrap().values().map(|p| p.slug.clone()).collect() };
+    if to != "*" && to != "dm" && !slugs.contains(&to) {
+        respond_json(request, json!({ "ok": false, "msg": "no such peer" }));
+        return;
+    }
     let mut st = state.lock().unwrap();
     match to.as_str() {
+        // broadcast: skip peers whose backlog is full rather than failing the
+        // whole mesh because one absent reader stopped draining
         "*" => {
             for slug in slugs {
                 if slug != from {
-                    st.plogs.entry(slug).or_default().push(("rtc".into(), msg.clone()));
+                    let log = st.plogs.entry(slug).or_default();
+                    if log.len() < RTC_BACKLOG {
+                        log.push(("rtc".into(), msg.clone()));
+                    }
                 }
             }
-            if from != "dm" {
+            if from != "dm" && st.dm_rtc.len() < RTC_BACKLOG {
                 st.dm_rtc.push(msg);
             }
         }
-        "dm" => st.dm_rtc.push(msg),
-        other => st.plogs.entry(other.to_string()).or_default().push(("rtc".into(), msg)),
+        "dm" => {
+            if st.dm_rtc.len() >= RTC_BACKLOG {
+                drop(st);
+                respond_json(request, json!({ "ok": false, "msg": "peer backlog full" }));
+                return;
+            }
+            st.dm_rtc.push(msg);
+        }
+        other => {
+            if st.plogs.get(other).is_some_and(|log| log.len() >= RTC_BACKLOG) {
+                drop(st);
+                respond_json(request, json!({ "ok": false, "msg": "peer backlog full" }));
+                return;
+            }
+            st.plogs.entry(other.to_string()).or_default().push(("rtc".into(), msg));
+        }
     }
     drop(st);
     respond_json(request, json!({ "ok": true }));
@@ -1211,8 +1335,14 @@ fn session_ctl(mut request: tiny_http::Request, state: &Arc<Mutex<State>>) {
 }
 
 fn session_start(state: &Arc<Mutex<State>>) -> Result<String> {
-    if state.lock().unwrap().live.is_some() {
-        return Err("a session is already running".into());
+    {
+        let st = state.lock().unwrap();
+        if st.live.is_some() {
+            return Err("a session is already running".into());
+        }
+        if st.session_ending {
+            return Err("previous session still archiving".into());
+        }
     }
     let lexicon = crate::listen::build_lexicon();
     let hotwords = crate::listen::hotword_names(&lexicon);
@@ -1233,12 +1363,33 @@ fn session_start(state: &Arc<Mutex<State>>) -> Result<String> {
     let url = std::env::var("MAGEHAND_STT_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:9090/inference".into());
     // one worker: transcript order beats parallelism
+    let err_state = Arc::clone(state);
     let worker = std::thread::spawn(move || {
+        let mut last_err_card: Option<Instant> = None;
         for job in job_rx {
             let text = match transcribe(&url, &job.wav, &hotwords) {
                 Ok(t) => crate::listen::clean_stt_line(&t),
                 Err(e) => {
                     eprintln!("serve: transcription failed: {e}");
+                    // surface a dead whisper-server on the DM feed, but only
+                    // one card per 5 minutes — every utterance fails at once
+                    if last_err_card.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
+                        last_err_card = Some(Instant::now());
+                        let body: String = e.to_string().chars().take(200).collect();
+                        let mut st = err_state.lock().unwrap();
+                        let id = st.next_id;
+                        st.next_id += 1;
+                        st.log.push(Ev::Card {
+                            id,
+                            card: json!({
+                                "signal": "trigger",
+                                "ts": crate::listen::now_hms(),
+                                "headline": "transcription failing",
+                                "body": body,
+                                "live": true,
+                            }),
+                        });
+                    }
                     continue;
                 }
             };
@@ -1259,7 +1410,19 @@ fn session_start(state: &Arc<Mutex<State>>) -> Result<String> {
 }
 
 fn session_end(state: &Arc<Mutex<State>>) -> Result<String> {
-    let live = state.lock().unwrap().live.take().ok_or("no session running")?;
+    let live = {
+        let mut st = state.lock().unwrap();
+        let live = st.live.take().ok_or("no session running")?;
+        st.session_ending = true; // same critical section as the take — no start can slip between
+        live
+    };
+    struct Ending<'a>(&'a Mutex<State>);
+    impl Drop for Ending<'_> {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().session_ending = false;
+        }
+    }
+    let _ending = Ending(state);
     let Live { jobs, live_path, handles } = live;
     drop(jobs); // worker drains the queue and exits; its line sender then ends the listener
     for h in handles {
@@ -1440,6 +1603,14 @@ fn json_hdr() -> Header {
 /// from disk cache.
 fn nostore_hdr() -> Header {
     header("Cache-Control", "no-store")
+}
+
+fn clear_cookie_hdr(name: &str, base: &Base) -> Header {
+    let secure = if base.secure { "; Secure" } else { "" };
+    header(
+        "Set-Cookie",
+        &format!("{name}=; Path={}/; SameSite=Lax; HttpOnly; Max-Age=0{secure}", base.path),
+    )
 }
 
 fn cookie_hdr(name: &str, token: &str, base: &Base) -> Header {
