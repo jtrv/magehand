@@ -126,6 +126,7 @@
 <script>
 const $ = s => document.querySelector(s);
 function esc(s){ const d=document.createElement('div'); d.textContent=s??''; return d.innerHTML; }
+function md(s){ return esc(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/(^|\s)\*(\S[^*]*?)\*/g,'$1<i>$2</i>'); }
 function toast(m){ const t=$('#toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2200); }
 
 // tabs
@@ -284,7 +285,7 @@ async function ask(){
     const r = await fetch('ask',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({q})});
     const j = await r.json();
-    a.innerHTML = esc(j.answer) + '<div class="foot">Ask your DM to be sure — this isn’t a ruling.</div>';
+    a.innerHTML = md(j.answer) + '<div class="foot">Ask your DM to be sure — this isn’t a ruling.</div>';
   }catch(e){ a.textContent='offline?'; }
   a.scrollIntoView();
 }
@@ -303,11 +304,13 @@ async function sendMsg(){
   const box = $('#mbox'); const text = box.value.trim(); if(!text) return;
   box.value='';
   $('#mlog').insertAdjacentHTML('beforeend', msgBubble({from:'me', text, ts:''}));
+  const stamp = $('#mlog').lastElementChild.querySelector('.mts');
   try{
     const r = await fetch('msg',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({text})});
     const j = await r.json();
     if(!j.ok) toast(j.msg||'send failed');
+    else stamp.textContent = 'you · ' + j.ts;
   }catch(e){ toast('offline?'); }
 }
 $('#msend').onclick = sendMsg;

@@ -793,12 +793,13 @@ fn msgs_path() -> String {
 }
 
 /// Session-scoped whisper ledger, not canon — same tier as the cards JSONL.
-fn append_msg(from: &str, to: &str, text: &str) -> Result<()> {
+fn append_msg(from: &str, to: &str, text: &str) -> Result<String> {
     std::fs::create_dir_all(".magehand")?;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(msgs_path())?;
-    let line = json!({ "ts": crate::listen::now_hms(), "from": from, "to": to, "text": text });
+    let ts = crate::listen::now_hms();
+    let line = json!({ "ts": ts, "from": from, "to": to, "text": text });
     f.write_all(format!("{line}\n").as_bytes())?;
-    Ok(())
+    Ok(ts)
 }
 
 fn msgs_for(slug: &str) -> Vec<Value> {
@@ -837,10 +838,13 @@ fn player_msg(
         }
         hits.push(now);
     }
-    if let Err(e) = append_msg(&p.slug, "dm", &text) {
-        respond_json(request, json!({ "ok": false, "msg": e.to_string() }));
-        return;
-    }
+    let ts = match append_msg(&p.slug, "dm", &text) {
+        Ok(ts) => ts,
+        Err(e) => {
+            respond_json(request, json!({ "ok": false, "msg": e.to_string() }));
+            return;
+        }
+    };
     let mut st = state.lock().unwrap();
     let id = st.next_id;
     st.next_id += 1;
@@ -848,7 +852,7 @@ fn player_msg(
         id,
         card: json!({
             "signal": "whisper",
-            "ts": crate::listen::now_hms(),
+            "ts": ts,
             "headline": format!("{} whispers", p.name),
             "body": text,
             "ref": p.slug,
@@ -856,7 +860,7 @@ fn player_msg(
         }),
     });
     drop(st);
-    respond_json(request, json!({ "ok": true }));
+    respond_json(request, json!({ "ok": true, "ts": ts }));
 }
 
 /// One SSE stream per player: DM replies now; map and RTC events later. Polls
@@ -1174,8 +1178,8 @@ fn handle_action(mut request: tiny_http::Request, state: Arc<Mutex<State>>) {
             if text.is_empty() || to.is_empty() {
                 Err("need reply text".into())
             } else {
-                append_msg("dm", &to, &text).map(|()| {
-                    let ev = json!({ "ts": crate::listen::now_hms(), "text": text });
+                append_msg("dm", &to, &text).map(|ts| {
+                    let ev = json!({ "ts": ts, "text": text });
                     state.lock().unwrap().plogs.entry(to).or_default().push(("dm".into(), ev));
                     "sent".into()
                 })
